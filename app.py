@@ -4,6 +4,7 @@ import plotly.express as px
 from datetime import datetime, date, timedelta
 import backend_engine  # Phase 1 Logic
 import sqlite3
+import os
 
 # ========================================================
 # CONFIGURATION & CONSTANTS
@@ -16,6 +17,29 @@ st.set_page_config(
 )
 
 CONFIDENCE_THRESHOLD = 80.0 
+
+# ========================================================
+# DATABASE & INITIALIZATION CHECKS
+# ========================================================
+
+def ensure_tables_exist():
+    """Ensures DB tables exist. If not, creates them."""
+    backend_engine.init_db()
+
+def is_account_initialized():
+    """Checks if the account_state table has data."""
+    try:
+        conn = backend_engine.get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM account_state")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count > 0
+    except sqlite3.OperationalError:
+        # Table likely doesn't exist
+        return False
+    except Exception as e:
+        return False
 
 # ========================================================
 # UTILITY FUNCTIONS
@@ -68,14 +92,51 @@ def load_data():
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # ========================================================
-# VIEW 1: DASHBOARD (Phase 2A)
+# VIEW: INITIALIZATION SCREEN (New)
+# ========================================================
+def render_initialization_screen():
+    st.markdown("""
+        <style>
+        .block-container {padding-top: 3rem;}
+        </style>
+    """, unsafe_allow_html=True)
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        st.image("https://cdn-icons-png.flaticon.com/512/4207/4207247.png", width=100)
+        st.title("Initialize Virtual Fund Manager")
+        st.markdown("### Welcome to your AI Trading Desk")
+        st.info("It looks like this is your first time running the system. Please set up your initial capital parameters to begin.")
+        
+        st.divider()
+        
+        with st.form("init_form"):
+            initial_capital = st.number_input("Starting Capital (INR)", min_value=1000.0, value=100000.0, step=1000.0, format="%.2f")
+            risk_pct = st.number_input("Weekly Loss Limit (%)", min_value=0.5, max_value=10.0, value=2.5, step=0.1)
+            
+            submitted = st.form_submit_button("🚀 Initialize Fund & Launch Dashboard", type="primary", use_container_width=True)
+            
+            if submitted:
+                try:
+                    # 1. Ensure tables exist
+                    ensure_tables_exist()
+                    # 2. Initialize Account Row
+                    backend_engine.initialize_account(initial_capital, risk_pct)
+                    st.success("Fund Initialized Successfully! Reloading...")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Initialization Failed: {e}")
+
+# ========================================================
+# VIEW 1: DASHBOARD
 # ========================================================
 def render_dashboard(account_df, trades_df):
     st.title("🏦 Capital & Portfolio Overview")
     st.markdown("---")
 
     if account_df.empty:
-        st.warning("⚠️ Account not initialized.")
+        st.warning("⚠️ Account state not readable.")
         return
 
     account = account_df.iloc[0]
@@ -124,7 +185,7 @@ def render_dashboard(account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 2: WEEKLY OPPORTUNITY BOOK (Phase 2B)
+# VIEW 2: WEEKLY OPPORTUNITY BOOK
 # ========================================================
 def render_opportunity_book(setups_df, account_df, trades_df):
     st.title("📅 Weekly Opportunity Book")
@@ -174,7 +235,7 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION & MANAGEMENT (Phase 2C)
+# VIEW 3: TRADE EXECUTION
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
@@ -295,12 +356,11 @@ def render_trade_execution(setups_df, trades_df):
                         st.rerun()
 
 # ========================================================
-# VIEW 4: PERFORMANCE & DISCIPLINE (Phase 2D)
+# VIEW 4: PERFORMANCE & DISCIPLINE
 # ========================================================
 def render_performance(all_trades, trade_actions, account_df):
     st.title("🏆 Performance & Discipline")
     st.markdown("### The Truth Screen")
-    st.caption("Metrics derived from executed trade data only. No theoretical paper trades.")
     st.markdown("---")
 
     if all_trades.empty or trade_actions.empty:
@@ -310,36 +370,21 @@ def render_performance(all_trades, trade_actions, account_df):
     # --- 1. PERFORMANCE SNAPSHOT ---
     st.subheader("1. System Performance Snapshot")
     
-    # Filter closed trades/actions for stats
     closed_actions = trade_actions[trade_actions['action_type'].isin(['TP1', 'TP2', 'SL', 'TIME_EXIT'])]
-    
-    total_trades = len(all_trades)
     winning_trades = closed_actions[closed_actions['net_pnl'] > 0]
     losing_trades = closed_actions[closed_actions['net_pnl'] <= 0]
     
     win_count = len(winning_trades)
-    loss_count = len(losing_trades)
-    total_closed = win_count + loss_count
-    
+    total_closed = len(closed_actions)
     win_rate = (win_count / total_closed * 100) if total_closed > 0 else 0.0
     avg_win = winning_trades['net_pnl'].mean() if not winning_trades.empty else 0.0
     avg_loss = losing_trades['net_pnl'].mean() if not losing_trades.empty else 0.0
-    
-    # Expectancy (R-Multiple approximation or simpler PnL expectancy)
     expectancy = (win_rate/100 * avg_win) + ((1 - win_rate/100) * avg_loss)
     
-    # Equity & Drawdown
-    initial_capital = 100000.0 # Default fallback, ideally stored
-    if not account_df.empty:
-        # Reconstruct initial from current total - realized pnl (approx)
-        # Better: Assume user input correct initial cap in init_db
-        # For display, we use total_capital from DB
-        current_equity = account_df.iloc[0]['total_capital']
-    else:
-        current_equity = 0.0
+    current_equity = account_df.iloc[0]['total_capital'] if not account_df.empty else 0.0
 
     m1, m2, m3, m4 = st.columns(4)
-    with m1: st.metric("Total Trades", total_trades)
+    with m1: st.metric("Total Trades", len(all_trades))
     with m2: st.metric("Win Rate", f"{win_rate:.1f}%")
     with m3: st.metric("Avg Win", format_currency(avg_win))
     with m4: st.metric("Avg Loss", format_currency(avg_loss))
@@ -354,14 +399,8 @@ def render_performance(all_trades, trade_actions, account_df):
 
     # --- 2. EQUITY CURVE ---
     st.subheader("2. Equity Curve")
-    
-    # Construct Equity Series
-    # Start with initial capital (Current - Realized PnL)
     start_cap = current_equity - account_df.iloc[0]['realized_pnl']
-    
-    equity_data = []
-    equity_data.append({'Date': 'Start', 'Equity': start_cap})
-    
+    equity_data = [{'Date': 'Start', 'Equity': start_cap}]
     running_equity = start_cap
     sorted_actions = trade_actions.sort_values(by='action_date')
     
@@ -372,7 +411,6 @@ def render_performance(all_trades, trade_actions, account_df):
             equity_data.append({'Date': row['action_date'], 'Equity': running_equity})
             
     eq_df = pd.DataFrame(equity_data)
-    
     if len(eq_df) > 1:
         fig = px.line(eq_df, x='Date', y='Equity', title='Portfolio Growth', markers=True)
         st.plotly_chart(fig, use_container_width=True)
@@ -383,46 +421,43 @@ def render_performance(all_trades, trade_actions, account_df):
 
     # --- 3. DISCIPLINE SCOREBOARD ---
     st.subheader("3. Discipline Scoreboard")
-    
-    # Logic to approximate discipline
-    # SL Respected: Did we exit near SL price? (Approximate check)
-    # Runners: Trades with TP1 actions
-    
-    tp1_actions = trade_actions[trade_actions['action_type'] == 'TP1']
-    runner_count = len(tp1_actions)
+    runner_count = len(trade_actions[trade_actions['action_type'] == 'TP1'])
     runner_pct = (runner_count / total_closed * 100) if total_closed > 0 else 0
     
     d1, d2, d3 = st.columns(3)
     with d1: st.metric("Trades Converted to Runners", f"{runner_count} ({runner_pct:.1f}%)")
     with d2: st.metric("Brokerage Paid (Total)", format_currency(trade_actions['brokerage_charges'].sum()))
     with d3: 
-        # Weekly Overtrade check
         week_start, week_end = get_current_week_dates()
         trades_this_week = all_trades[pd.to_datetime(all_trades['entry_date']).dt.date >= week_start]
-        count_week = len(trades_this_week)
-        st.metric("Trades This Week", f"{count_week} / 3 (Max)")
+        st.metric("Trades This Week", f"{len(trades_this_week)} / 3 (Max)")
 
 # ========================================================
 # MAIN APP CONTROLLER
 # ========================================================
 
-# Load Global Data
-account_state, active_trades, weekly_setups, all_trades, trade_actions = load_data()
+# Check Initialization State FIRST
+ensure_tables_exist()
 
-# Sidebar Navigation
-with st.sidebar:
-    st.header("🧭 Fund Desk")
-    page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
-    
-    st.divider()
-    st.caption("Virtual AI Fund Manager v1.0")
+if not is_account_initialized():
+    render_initialization_screen()
+else:
+    # NORMAL APP FLOW
+    account_state, active_trades, weekly_setups, all_trades, trade_actions = load_data()
 
-# Route to Page
-if page == "Dashboard":
-    render_dashboard(account_state, active_trades)
-elif page == "Weekly Opportunities":
-    render_opportunity_book(weekly_setups, account_state, active_trades)
-elif page == "Trade Execution":
-    render_trade_execution(weekly_setups, active_trades)
-elif page == "Performance & Analytics":
-    render_performance(all_trades, trade_actions, account_state)
+    # Sidebar Navigation
+    with st.sidebar:
+        st.header("🧭 Fund Desk")
+        page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
+        st.divider()
+        st.caption("Virtual AI Fund Manager v1.0")
+
+    # Route to Page
+    if page == "Dashboard":
+        render_dashboard(account_state, active_trades)
+    elif page == "Weekly Opportunities":
+        render_opportunity_book(weekly_setups, account_state, active_trades)
+    elif page == "Trade Execution":
+        render_trade_execution(weekly_setups, active_trades)
+    elif page == "Performance & Analytics":
+        render_performance(all_trades, trade_actions, account_state)
