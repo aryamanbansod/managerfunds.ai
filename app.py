@@ -16,7 +16,10 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-CONFIDENCE_THRESHOLD = 80.0 
+# Path to the AI Brain's output CSV
+# GitHub Actions saves it here. Ensure this path matches your repo structure.
+AI_SIGNALS_PATH = "data/signals/smart_money_tradr_signals.csv" 
+CONFIDENCE_THRESHOLD = 90.0 # Score to be considered "TRADR-GRADE"
 
 # ========================================================
 # DATABASE & INITIALIZATION CHECKS
@@ -36,10 +39,52 @@ def is_account_initialized():
         conn.close()
         return count > 0
     except sqlite3.OperationalError:
-        # Table likely doesn't exist
         return False
     except Exception as e:
         return False
+
+# ========================================================
+# DATA SYNC & LOADING
+# ========================================================
+
+def sync_ai_data():
+    """
+    WIRES THE CSV TO THE DATABASE.
+    Checks for the AI signal CSV and loads it into SQLite via backend_engine.
+    This ensures the Dashboard always sees what the AI saw.
+    """
+    if os.path.exists(AI_SIGNALS_PATH):
+        try:
+            # We use the backend function to ingest CSV safely
+            # It handles duplicates (UPSERT) automatically
+            backend_engine.load_ai_weekly_setups(AI_SIGNALS_PATH)
+            return True
+        except Exception as e:
+            st.error(f"Error syncing AI data: {e}")
+            return False
+    return False
+
+def load_data():
+    """Fetches fresh data from backend engine after syncing."""
+    try:
+        # 1. Sync latest AI signals first
+        sync_ai_data()
+
+        # 2. Fetch from DB (Single Source of Truth)
+        account_state = backend_engine.get_account_state()
+        active_trades = backend_engine.get_active_trades()
+        weekly_setups = backend_engine.get_weekly_setups()
+        
+        # Load all trades (active + closed) for performance analysis
+        conn = backend_engine.get_db_connection()
+        all_trades = pd.read_sql_query("SELECT * FROM trades", conn)
+        trade_actions = pd.read_sql_query("SELECT * FROM trade_actions", conn)
+        conn.close()
+        
+        return account_state, active_trades, weekly_setups, all_trades, trade_actions
+    except Exception as e:
+        st.error(f"Error connecting to database: {e}")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
 # ========================================================
 # UTILITY FUNCTIONS
@@ -72,56 +117,23 @@ def skip_setup(setup_id):
     conn.close()
 
 # ========================================================
-# DATA LOADING
-# ========================================================
-def load_data():
-    try:
-        account_state = backend_engine.get_account_state()
-        active_trades = backend_engine.get_active_trades()
-        weekly_setups = backend_engine.get_weekly_setups()
-        
-        # Load all trades (active + closed) for performance analysis
-        conn = backend_engine.get_db_connection()
-        all_trades = pd.read_sql_query("SELECT * FROM trades", conn)
-        trade_actions = pd.read_sql_query("SELECT * FROM trade_actions", conn)
-        conn.close()
-        
-        return account_state, active_trades, weekly_setups, all_trades, trade_actions
-    except Exception as e:
-        st.error(f"Error connecting to database: {e}")
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-
-# ========================================================
-# VIEW: INITIALIZATION SCREEN (New)
+# VIEW: INITIALIZATION SCREEN
 # ========================================================
 def render_initialization_screen():
-    st.markdown("""
-        <style>
-        .block-container {padding-top: 3rem;}
-        </style>
-    """, unsafe_allow_html=True)
-    
+    st.markdown("""<style>.block-container {padding-top: 3rem;}</style>""", unsafe_allow_html=True)
     col1, col2, col3 = st.columns([1, 2, 1])
-    
     with col2:
         st.image("https://cdn-icons-png.flaticon.com/512/4207/4207247.png", width=100)
         st.title("Initialize Virtual Fund Manager")
         st.markdown("### Welcome to your AI Trading Desk")
-        st.info("It looks like this is your first time running the system. Please set up your initial capital parameters to begin.")
-        
-        st.divider()
-        
+        st.info("First run detected. Please set up your initial capital parameters.")
         with st.form("init_form"):
             initial_capital = st.number_input("Starting Capital (INR)", min_value=1000.0, value=100000.0, step=1000.0, format="%.2f")
             risk_pct = st.number_input("Weekly Loss Limit (%)", min_value=0.5, max_value=10.0, value=2.5, step=0.1)
-            
             submitted = st.form_submit_button("🚀 Initialize Fund & Launch Dashboard", type="primary", use_container_width=True)
-            
             if submitted:
                 try:
-                    # 1. Ensure tables exist
                     ensure_tables_exist()
-                    # 2. Initialize Account Row
                     backend_engine.initialize_account(initial_capital, risk_pct)
                     st.success("Fund Initialized Successfully! Reloading...")
                     st.rerun()
@@ -134,7 +146,6 @@ def render_initialization_screen():
 def render_dashboard(account_df, trades_df):
     st.title("🏦 Capital & Portfolio Overview")
     st.markdown("---")
-
     if account_df.empty:
         st.warning("⚠️ Account state not readable.")
         return
@@ -157,7 +168,6 @@ def render_dashboard(account_df, trades_df):
         st.metric("Trading Status", status_text)
 
     st.markdown("---")
-
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Realized P&L (All Time)", format_currency(realized_pnl), delta=f"{realized_pnl:,.2f}")
     with c2: st.metric("Weekly P&L", format_currency(weekly_pnl), delta=f"{weekly_pnl:,.2f}")
@@ -185,61 +195,101 @@ def render_dashboard(account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 2: WEEKLY OPPORTUNITY BOOK
+# VIEW 2: WEEKLY OPPORTUNITY BOOK (WIRED)
 # ========================================================
 def render_opportunity_book(setups_df, account_df, trades_df):
     st.title("📅 Weekly Opportunity Book")
     start_date, end_date = get_current_week_dates()
-    st.markdown(f"#### **Current Trading Week:** {start_date.strftime('%d %b')} — {end_date.strftime('%d %b %Y')}")
-    st.markdown("---")
+    today_date = date.today()
+    
+    st.markdown(f"#### **Trading Week:** {start_date.strftime('%d %b')} — {end_date.strftime('%d %b %Y')}")
+    
+    # 1. Filter for Current Week Only (Monday to Friday)
+    if not setups_df.empty:
+        # Convert week_start_date in DB to date object
+        setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
+        current_week_setups = setups_df[setups_df['week_start_dt'] == start_date].copy()
+    else:
+        current_week_setups = pd.DataFrame()
 
-    if setups_df.empty:
-        st.info("No setups detected for this week yet.")
+    if current_week_setups.empty:
+        st.info("💤 No setups detected for this week yet. The AI scanner runs daily at 8:30 AM.")
+        st.caption(f"Waiting for signals from: {AI_SIGNALS_PATH}")
         return
 
-    setups_df['confidence_score'] = pd.to_numeric(setups_df['confidence_score'], errors='coerce').fillna(0)
+    # 2. Check for "Actionable Today"
+    # We check if 'first_detected_date' matches today
+    current_week_setups['detected_dt'] = pd.to_datetime(current_week_setups['first_detected_date']).dt.date
+    today_signals = current_week_setups[current_week_setups['detected_dt'] == today_date]
+    
+    if not today_signals.empty:
+        st.success(f"🚀 **ACTIONABLE TODAY:** {len(today_signals)} New Signal(s) Detected!")
+    else:
+        st.info("❌ No new setups generated today. Showing active setups from earlier this week.")
+
+    st.markdown("---")
+
+    # 3. Categorize & Display
+    # Ensure confidence_score is numeric
+    current_week_setups['confidence_score'] = pd.to_numeric(current_week_setups['confidence_score'], errors='coerce').fillna(0)
     
     def determine_grade(score):
         return "🚀 TRADR-GRADE" if score >= CONFIDENCE_THRESHOLD else "⚠️ ALTERNATIVE"
 
-    setups_df['Grade'] = setups_df['confidence_score'].apply(determine_grade)
+    current_week_setups['Grade'] = current_week_setups['confidence_score'].apply(determine_grade)
 
-    tradr_count = len(setups_df[setups_df['Grade'] == "🚀 TRADR-GRADE"])
-    alt_count = len(setups_df[setups_df['Grade'] == "⚠️ ALTERNATIVE"])
-    active_trade_count = len(trades_df)
-    is_halted = account_df.iloc[0]['trading_halted'] if not account_df.empty else False
+    # Separate Lists
+    tradr_grade = current_week_setups[current_week_setups['Grade'] == "🚀 TRADR-GRADE"]
+    alternatives = current_week_setups[current_week_setups['Grade'] == "⚠️ ALTERNATIVE"]
 
-    kpi1, kpi2, kpi3, kpi4 = st.columns(4)
-    with kpi1: st.metric("🚀 TRADR-Grade Setups", tradr_count)
-    with kpi2: st.metric("⚠️ Alternative Setups", alt_count)
-    with kpi3: st.metric("🟡 Active Trades", active_trade_count)
-    with kpi4: 
-        status_label = "⛔ HALTED" if is_halted else "✅ ENABLED"
-        st.metric("Trading Status", status_label)
+    # --- SECTION A: TRADR-GRADE ---
+    st.subheader("🚀 High-Confidence Setups (TRADR-GRADE)")
+    if tradr_grade.empty:
+        st.caption("No high-confidence setups found this week.")
+    else:
+        display_cols = ['ticker', 'setup_type', 'entry_price', 'stop_loss', 'target1', 'target2', 'expected_move_pct', 'confidence_score', 'first_detected_date', 'status']
+        st.dataframe(
+            tradr_grade[display_cols],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "ticker": "Ticker",
+                "setup_type": "Pattern",
+                "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
+                "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
+                "target2": st.column_config.NumberColumn("TP2", format="₹%.2f"),
+                "expected_move_pct": st.column_config.NumberColumn("Pot. ROI", format="%.1f%%"),
+                "confidence_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+                "first_detected_date": "Detected",
+                "status": st.column_config.TextColumn("Status"),
+            }
+        )
 
     st.markdown("---")
-    st.subheader("🔍 Identified Opportunities (Mon–Fri)")
 
-    cols_to_show = ['ticker', 'Grade', 'setup_type', 'entry_price', 'stop_loss', 'target1', 'target2', 'quantity', 'risk_amount', 'expected_move_pct', 'confidence_score', 'status']
-    available_cols = [c for c in cols_to_show if c in setups_df.columns]
-    
-    st.dataframe(
-        setups_df[available_cols], use_container_width=True, hide_index=True,
-        column_config={
-            "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
-            "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
-            "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
-            "target2": st.column_config.NumberColumn("TP2", format="₹%.2f"),
-            "confidence_score": st.column_config.ProgressColumn("Confidence", min_value=0, max_value=100, format="%d"),
-        }
-    )
+    # --- SECTION B: ALTERNATIVES ---
+    st.subheader("⚠️ Alternative Setups (Watchlist)")
+    if alternatives.empty:
+        st.caption("No alternative setups found.")
+    else:
+        display_cols = ['ticker', 'setup_type', 'entry_price', 'stop_loss', 'target1', 'confidence_score', 'first_detected_date', 'status']
+        st.dataframe(
+            alternatives[display_cols],
+            use_container_width=True, hide_index=True,
+            column_config={
+                "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
+                "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
+                "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
+                "confidence_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
+            }
+        )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION
+# VIEW 3: TRADE EXECUTION (WIRED)
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
-    st.caption("Confirm entries, book profits, and manage stops. Strict discipline required.")
+    st.caption("Execute trades based on this week's opportunity book.")
     st.markdown("---")
 
     mode = st.radio("Select List:", ["New Setups (Awaiting Entry)", "Active Trades (Open)"], horizontal=True)
@@ -247,18 +297,28 @@ def render_trade_execution(setups_df, trades_df):
     trade_source = None 
 
     if mode == "New Setups (Awaiting Entry)":
+        # FILTER: Show only setups from current week that are 'AWAITING_ENTRY'
+        start_date, end_date = get_current_week_dates()
+        
         if setups_df.empty:
-            st.info("No setups available.")
+            st.info("No setups loaded.")
+            candidates = pd.DataFrame()
         else:
-            candidates = setups_df[setups_df['status'] == 'AWAITING_ENTRY']
-            if candidates.empty:
-                st.info("No setups currently awaiting entry.")
-            else:
-                options = candidates['ticker'].tolist()
-                selected_ticker = st.selectbox("Select Ticker to Act On:", options)
-                if selected_ticker:
-                    selected_trade = candidates[candidates['ticker'] == selected_ticker].iloc[0]
-                    trade_source = 'setup'
+            setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
+            # Filter: Current Week AND Status is Awaiting
+            candidates = setups_df[
+                (setups_df['week_start_dt'] == start_date) & 
+                (setups_df['status'] == 'AWAITING_ENTRY')
+            ]
+
+        if candidates.empty:
+            st.info("No actionable setups awaiting entry for this week.")
+        else:
+            options = candidates['ticker'].tolist()
+            selected_ticker = st.selectbox("Select Ticker to Execute:", options)
+            if selected_ticker:
+                selected_trade = candidates[candidates['ticker'] == selected_ticker].iloc[0]
+                trade_source = 'setup'
     else:
         if trades_df.empty:
             st.info("No active trades.")
@@ -277,11 +337,12 @@ def render_trade_execution(setups_df, trades_df):
         with c1:
             st.markdown(f"### 🎫 {selected_trade['ticker']}")
             if trade_source == 'setup':
-                st.caption(f"Setup: {selected_trade['setup_type']}")
+                st.caption(f"Pattern: {selected_trade['setup_type']}")
                 st.metric("Entry Trigger", format_currency(selected_trade['entry_price']))
                 st.metric("Stop Loss", format_currency(selected_trade['stop_loss']))
                 st.metric("Target 1", format_currency(selected_trade['target1']))
                 st.metric("Quantity", selected_trade['quantity'])
+                st.caption(f"Confidence: {selected_trade.get('confidence_score', 0)}")
             else:
                 st.caption(f"Status: {selected_trade['trade_status']}")
                 st.metric("Entry Price", format_currency(selected_trade['entry_price']))
@@ -292,7 +353,7 @@ def render_trade_execution(setups_df, trades_df):
             st.subheader("⚙️ Execution Console")
             
             if trade_source == 'setup':
-                st.info("💡 **Action Required:** Has the price touched the entry level?")
+                st.info(f"💡 **Confirm Entry:** Current Price should be near {format_currency(selected_trade['entry_price'])}")
                 col_ex1, col_ex2 = st.columns(2)
                 with col_ex1:
                     if st.button("✅ CONFIRM ENTRY TAKEN", type="primary", use_container_width=True):
@@ -336,7 +397,6 @@ def render_trade_execution(setups_df, trades_df):
 
                 elif action == "❌ Stop Loss Exit":
                     st.markdown("#### Stop Loss Execution")
-                    st.warning("Ensure you have exited positions in your broker app first.")
                     exit_qty = st.number_input("Quantity Exited", min_value=1, max_value=current_qty, value=current_qty)
                     exit_price = st.number_input("Exit Price", value=float(selected_trade['stop_loss']))
                     brokerage = st.number_input("Total Brokerage & Charges (₹)", min_value=0.0, step=10.0)
@@ -362,14 +422,11 @@ def render_performance(all_trades, trade_actions, account_df):
     st.title("🏆 Performance & Discipline")
     st.markdown("### The Truth Screen")
     st.markdown("---")
-
     if all_trades.empty or trade_actions.empty:
         st.info("Insufficient data to generate performance metrics. Execute some trades first.")
         return
 
-    # --- 1. PERFORMANCE SNAPSHOT ---
     st.subheader("1. System Performance Snapshot")
-    
     closed_actions = trade_actions[trade_actions['action_type'].isin(['TP1', 'TP2', 'SL', 'TIME_EXIT'])]
     winning_trades = closed_actions[closed_actions['net_pnl'] > 0]
     losing_trades = closed_actions[closed_actions['net_pnl'] <= 0]
@@ -396,8 +453,6 @@ def render_performance(all_trades, trade_actions, account_df):
     with m8: st.metric("Profit Factor", f"{abs(avg_win/avg_loss):.2f}" if avg_loss != 0 else "N/A")
 
     st.markdown("---")
-
-    # --- 2. EQUITY CURVE ---
     st.subheader("2. Equity Curve")
     start_cap = current_equity - account_df.iloc[0]['realized_pnl']
     equity_data = [{'Date': 'Start', 'Equity': start_cap}]
@@ -418,12 +473,9 @@ def render_performance(all_trades, trade_actions, account_df):
         st.caption("Equity curve will appear after first closed trade.")
 
     st.markdown("---")
-
-    # --- 3. DISCIPLINE SCOREBOARD ---
     st.subheader("3. Discipline Scoreboard")
     runner_count = len(trade_actions[trade_actions['action_type'] == 'TP1'])
     runner_pct = (runner_count / total_closed * 100) if total_closed > 0 else 0
-    
     d1, d2, d3 = st.columns(3)
     with d1: st.metric("Trades Converted to Runners", f"{runner_count} ({runner_pct:.1f}%)")
     with d2: st.metric("Brokerage Paid (Total)", format_currency(trade_actions['brokerage_charges'].sum()))
@@ -435,29 +487,26 @@ def render_performance(all_trades, trade_actions, account_df):
 # ========================================================
 # MAIN APP CONTROLLER
 # ========================================================
+if __name__ == "__main__":
+    ensure_tables_exist()
 
-# Check Initialization State FIRST
-ensure_tables_exist()
+    if not is_account_initialized():
+        render_initialization_screen()
+    else:
+        # Load and Sync Data
+        account_state, active_trades, weekly_setups, all_trades, trade_actions = load_data()
 
-if not is_account_initialized():
-    render_initialization_screen()
-else:
-    # NORMAL APP FLOW
-    account_state, active_trades, weekly_setups, all_trades, trade_actions = load_data()
+        with st.sidebar:
+            st.header("🧭 Fund Desk")
+            page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
+            st.divider()
+            st.caption("Virtual AI Fund Manager v1.2 (Live Wired)")
 
-    # Sidebar Navigation
-    with st.sidebar:
-        st.header("🧭 Fund Desk")
-        page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
-        st.divider()
-        st.caption("Virtual AI Fund Manager v1.0")
-
-    # Route to Page
-    if page == "Dashboard":
-        render_dashboard(account_state, active_trades)
-    elif page == "Weekly Opportunities":
-        render_opportunity_book(weekly_setups, account_state, active_trades)
-    elif page == "Trade Execution":
-        render_trade_execution(weekly_setups, active_trades)
-    elif page == "Performance & Analytics":
-        render_performance(all_trades, trade_actions, account_state)
+        if page == "Dashboard":
+            render_dashboard(account_state, active_trades)
+        elif page == "Weekly Opportunities":
+            render_opportunity_book(weekly_setups, account_state, active_trades)
+        elif page == "Trade Execution":
+            render_trade_execution(weekly_setups, active_trades)
+        elif page == "Performance & Analytics":
+            render_performance(all_trades, trade_actions, account_state)
