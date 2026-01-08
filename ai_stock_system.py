@@ -8,6 +8,7 @@
 # 3. 🧱 CMP EXECUTION GATE: Forces "Set & Forget" entries.
 # 4. 🏦 SMART MONEY CONFIRMATION: Optional Fundamental Veto.
 # 5. 📅 WEEKLY MEMORY (NEW): Tracks setups Mon-Fri.
+# 6. ⏰ TIME-AWARE EXECUTION: Market Hours vs Off-Hours Logic.
 #
 # ==============================================================================
 
@@ -30,7 +31,6 @@ pd.set_option('display.float_format', '{:.2f}'.format)
 
 # --- USER CONFIGURATION ---
 CONFIG = {
-    # Changed from Drive path to local relative path for GitHub Actions
     "base_drive_path": ".", 
     "history_years": 2,
     "min_liquidity_volume": 500000,
@@ -87,8 +87,31 @@ UNIVERSE_TICKERS = [
 ]
 
 # ==============================================================================
-# 2. SETUP & DATA MANAGEMENT
+# 2. TIME & ENVIRONMENT UTILS
 # ==============================================================================
+
+def get_market_status():
+    """
+    Determines if the Indian Equity Market is currently open.
+    IST Timezone: UTC + 5:30
+    Market Hours: 09:15 to 15:30
+    Weekdays: Mon(0) to Fri(4)
+    """
+    # Define IST Timezone
+    IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))
+    now_ist = datetime.datetime.now(IST)
+    
+    # Define Market Start and End times for today
+    market_start = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_end = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    is_weekday = now_ist.weekday() < 5  # 0=Mon, 4=Fri
+    is_time_open = market_start <= now_ist <= market_end
+    
+    if is_weekday and is_time_open:
+        return "MARKET_OPEN", now_ist
+    else:
+        return "MARKET_CLOSED", now_ist
 
 def setup_environment():
     """Sets up folders and weekly context."""
@@ -99,8 +122,6 @@ def setup_environment():
     today_str = today_date.strftime("%Y-%m-%d")
 
     # --- WEEKLY LOGIC ---
-    # Calculate current week start (Monday) and end (Friday)
-    # Mon=0, Sun=6
     week_start_date = today_date - datetime.timedelta(days=today_date.weekday())
     week_end_date = week_start_date + datetime.timedelta(days=4)
     week_start_str = week_start_date.strftime("%Y-%m-%d")
@@ -118,8 +139,8 @@ def setup_environment():
         "inst":      os.path.join(base_path, "data", "institutional"),
         "combined":  os.path.join(base_path, "data", "combined"),
         "backtest":  os.path.join(base_path, "backtests"),
-        "dashboard": os.path.join(base_path, "dashboard", today_str), # Daily Log
-        "weekly":    weekly_path # Weekly Master Log
+        "dashboard": os.path.join(base_path, "dashboard", today_str),
+        "weekly":    weekly_path
     }
 
     for k, path in dirs.items():
@@ -127,7 +148,6 @@ def setup_environment():
 
     print(f"✅ Folder structure verified.")
     print(f"   📅 Current Week: {week_start_str} to {week_end_str}")
-    print(f"   📂 Weekly Book: {weekly_path}")
     
     return dirs, today_str, week_start_str, week_end_str
 
@@ -136,6 +156,7 @@ def update_data(save_dir):
     print("\nStep 3: Updating Market Data...")
     
     all_dfs = []
+    # Fetch ample history for indicators
     start_date = (datetime.datetime.today() - datetime.timedelta(days=CONFIG['history_years']*365)).strftime('%Y-%m-%d')
     end_date = datetime.datetime.today().strftime('%Y-%m-%d')
 
@@ -149,7 +170,6 @@ def update_data(save_dir):
                 if len(UNIVERSE_TICKERS) == 1: 
                     df = data.copy()
                 else: 
-                    # Handle MultiIndex if necessary, though group_by='ticker' usually separates them
                     try:
                         df = data[ticker].copy()
                     except KeyError:
@@ -169,7 +189,6 @@ def update_data(save_dir):
 
     if all_dfs:
         combined_df = pd.concat(all_dfs, ignore_index=True)
-        # Ensure Date is datetime
         combined_df['Date'] = pd.to_datetime(combined_df['Date'])
         
         save_path = os.path.join(save_dir, "all_prices_combined.csv")
@@ -202,13 +221,11 @@ def run_unified_engine(df_prices, dirs):
     df['avg_vol'] = g['Volume'].transform(lambda x: x.rolling(CONFIG['avg_volume_window']).mean())
 
     df['prev_close'] = g['Close'].shift(1)
-    # True Range
     df['tr'] = df[['High', 'Low', 'prev_close']].apply(
         lambda x: max(x['High']-x['Low'], abs(x['High']-x['prev_close']), abs(x['Low']-x['prev_close'])), 
         axis=1
     )
     df['atr_short'] = g['tr'].transform(lambda x: x.rolling(CONFIG['atr_lookback']).mean())
-    # df['atr_long'] = g['tr'].transform(lambda x: x.rolling(CONFIG['atr_reference']).mean()) # Unused but preserved
 
     df['roi_10d'] = g['Close'].transform(lambda x: x.pct_change(10))
     df['roi_20d'] = g['Close'].transform(lambda x: x.pct_change(20))
@@ -276,7 +293,7 @@ def run_unified_engine(df_prices, dirs):
     signals = df[valid_signal].copy()
 
     # Determine "Days to Target" (Estimation)
-    signals['days_to_target'] = CONFIG['max_holding_days'] # Default placeholder logic as per original nb
+    signals['days_to_target'] = CONFIG['max_holding_days']
 
     signals['super_score'] = 80
     signals.loc[signals['SETUP_TYPE'] == "HIGH_TIGHT_FLAG", 'super_score'] += 15
@@ -305,15 +322,21 @@ def smart_money_fundamental_check(ticker):
         return "NEUTRAL", "No Data"
     return "NEUTRAL", "No Red Flags"
 
-def process_execution_gates(signals, df_prices, dirs, today_str, week_start_str, week_end_str):
-    """Filters signals through execution gates and updates weekly memory."""
-    print("\nStep 5: Running Execution & Updating Weekly Book...")
+def process_execution_gates(signals, df_prices, dirs, today_str, week_start_str, week_end_str, market_status):
+    """
+    Filters signals through execution gates and updates weekly memory.
+    
+    Logic:
+    - MARKET_OPEN: Allows new entries to be generated and saved to 'weekly_setups.csv'.
+    - MARKET_CLOSED: Runs analysis but prevents saving NEW aggressive entries to avoid bad data.
+      Useful for watchlist updates/fundamental checks without flooding the dashboard.
+    """
+    print(f"\nStep 5: Running Execution Gates in [{market_status}] Mode...")
     
     todays_candidates = []
     
     if not signals.empty:
         latest_date = signals['Date'].max()
-        # Strictly fresh signals (latest available date in data)
         fresh_signals = signals[signals['Date'] >= (latest_date - datetime.timedelta(days=2))].copy()
         fresh_signals = fresh_signals.sort_values('super_score', ascending=False).drop_duplicates('Ticker')
 
@@ -375,35 +398,48 @@ def process_execution_gates(signals, df_prices, dirs, today_str, week_start_str,
                 'Est_Days': row['days_to_target'],
                 'Fund_Status': fund_status,
                 'Detected_Date': today_str,
-                'Status': "ACTIVE"
+                'Status': "AWAITING_ENTRY"
             })
 
-    # B. UPDATE WEEKLY BOOK
-    weekly_csv_path = os.path.join(dirs['weekly'], "weekly_setups.csv")
+    # --- MODE SPECIFIC LOGIC ---
     
+    # Load existing book
+    weekly_csv_path = os.path.join(dirs['weekly'], "weekly_setups.csv")
     if os.path.exists(weekly_csv_path):
         weekly_book_df = pd.read_csv(weekly_csv_path)
     else:
         weekly_book_df = pd.DataFrame()
 
-    # Append new ones if not already in book for this week
-    if todays_candidates:
-        new_df = pd.DataFrame(todays_candidates)
-        if not weekly_book_df.empty:
-            # Avoid duplicates based on Ticker
-            existing_tickers = weekly_book_df['Ticker'].tolist()
-            new_df = new_df[~new_df['Ticker'].isin(existing_tickers)]
+    if market_status == "MARKET_CLOSED":
+        print("🌙 OFF-MARKET MODE: Scanning for opportunities (Watchlist Update Only).")
+        print(f"   found {len(todays_candidates)} potential candidates (Not Saving to CSV).")
+        # In Light/Off-Market mode, we do NOT append new setups to avoid data noise.
+        # We only return the candidates for printing to the console/log.
+        return todays_candidates, weekly_book_df
 
-        weekly_book_df = pd.concat([weekly_book_df, new_df], ignore_index=True)
-
-    # Save Master Book
-    if not weekly_book_df.empty:
-        weekly_book_df.to_csv(weekly_csv_path, index=False)
-        print(f"   📘 Weekly Book Updated: {len(weekly_book_df)} active setups.")
+    elif market_status == "MARKET_OPEN":
+        print("🚀 MARKET OPEN: Full Execution Mode Active.")
         
-    return todays_candidates, weekly_book_df
+        # Append new ones if not already in book for this week
+        if todays_candidates:
+            new_df = pd.DataFrame(todays_candidates)
+            if not weekly_book_df.empty:
+                # Avoid duplicates based on Ticker
+                existing_tickers = weekly_book_df['Ticker'].tolist()
+                new_df = new_df[~new_df['Ticker'].isin(existing_tickers)]
 
-def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_start_str, week_end_str):
+            if not new_df.empty:
+                weekly_book_df = pd.concat([weekly_book_df, new_df], ignore_index=True)
+                print(f"   ✅ Added {len(new_df)} NEW setups to Weekly Book.")
+
+        # Save Master Book
+        if not weekly_book_df.empty:
+            weekly_book_df.to_csv(weekly_csv_path, index=False)
+            print(f"   📘 Weekly Book Persisted: {len(weekly_book_df)} active setups.")
+        
+        return todays_candidates, weekly_book_df
+
+def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_start_str, week_end_str, market_status):
     """Prints the final summary to console."""
     print("\nStep 6: Generating Weekly Fund Manager Dashboard...")
 
@@ -418,6 +454,7 @@ def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_sta
 
     print("\n" + "="*60)
     print(f"🎯 MORNING DASHBOARD (WEEKLY VIEW) - {today_str}")
+    print(f"⏰ STATUS: {market_status}")
     print("="*60)
     print(f"💰 Total Capital:  ₹{current_capital:,.2f}")
     print(f"📅 Trading Week:   {week_start_str} to {week_end_str}")
@@ -434,6 +471,9 @@ def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_sta
         disp['Target1'] = disp['Target1'].map('{:,.2f}'.format)
         disp['Target2'] = disp['Target2'].map('{:,.2f}'.format)
         print(disp[cols].to_string(index=False))
+        
+        if market_status == "MARKET_CLOSED":
+            print("\n   ⚠️ (OFF-MARKET: These were NOT saved to DB to prevent noise)")
     else:
         print("   (No new setups today)")
 
@@ -441,22 +481,19 @@ def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_sta
     print("\n📚 CURRENT WEEK ACTIVE BOOK (MON-FRI):")
     if not weekly_book_df.empty:
         cols = ['Ticker', 'Setup', 'Entry', 'StopLoss', 'Target1', 'Target2', 'Status', 'Detected_Date']
+        # Check if columns exist
+        available_cols = [c for c in cols if c in weekly_book_df.columns]
+        
         disp = weekly_book_df.copy()
-        disp['Entry'] = disp['Entry'].map('{:,.2f}'.format)
-        disp['StopLoss'] = disp['StopLoss'].map('{:,.2f}'.format)
-        disp['Target1'] = disp['Target1'].map('{:,.2f}'.format)
-        disp['Target2'] = disp['Target2'].map('{:,.2f}'.format)
-        print(disp[cols].to_string(index=False))
+        if 'Entry' in disp.columns: disp['Entry'] = disp['Entry'].map('{:,.2f}'.format)
+        if 'StopLoss' in disp.columns: disp['StopLoss'] = disp['StopLoss'].map('{:,.2f}'.format)
+        if 'Target1' in disp.columns: disp['Target1'] = disp['Target1'].map('{:,.2f}'.format)
+        if 'Target2' in disp.columns: disp['Target2'] = disp['Target2'].map('{:,.2f}'.format)
+        print(disp[available_cols].to_string(index=False))
     else:
         print("   (Book is empty for this week)")
 
     print("\n" + "="*60)
-
-    # Archive Daily Logs
-    if todays_candidates:
-        daily_log_path = os.path.join(dirs['weekly'], f"daily_log_{today_str}.csv")
-        pd.DataFrame(todays_candidates).to_csv(daily_log_path, index=False)
-
     print("🏁 EXECUTION COMPLETE")
 
 # ==============================================================================
@@ -465,17 +502,25 @@ def print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, week_sta
 if __name__ == "__main__":
     print("✅ Libraries loaded & Configuration set.")
     
+    # 0. Check Time & Mode
+    status, ist_time = get_market_status()
+    print(f"🕒 Current IST Time: {ist_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"🚦 Execution Mode: {status}")
+
     # 1. Setup
     dirs, today_str, w_start, w_end = setup_environment()
     
     # 2. Update Data
+    # We download data regardless of mode to keep cache fresh
     df_prices = update_data(save_dir=dirs['prices'])
     
     # 3. Run Strategy
     signals = run_unified_engine(df_prices, dirs)
     
-    # 4. Process Gates & Memory
-    todays_candidates, weekly_book_df = process_execution_gates(signals, df_prices, dirs, today_str, w_start, w_end)
+    # 4. Process Gates & Memory (Mode Dependent)
+    todays_candidates, weekly_book_df = process_execution_gates(
+        signals, df_prices, dirs, today_str, w_start, w_end, market_status=status
+    )
     
     # 5. Dashboard Output
-    print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, w_start, w_end)
+    print_dashboard(todays_candidates, weekly_book_df, dirs, today_str, w_start, w_end, market_status=status)
