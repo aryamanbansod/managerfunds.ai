@@ -116,16 +116,17 @@ def skip_setup(setup_id):
     conn.close()
 
 # ========================================================
-# DECISION CLARITY LOGIC (PHASE 3A)
+# DECISION & CAPITAL INTELLIGENCE LOGIC (PHASE 3A + 3B)
 # ========================================================
-def enrich_setup_data(df):
+def enrich_setup_data(df, total_capital):
     """
     Adds Decision Clarity fields (Grade, Confidence, Logic) 
-    derived from existing technical data. UI ONLY.
+    AND Capital Intelligence fields (Risk ₹, Risk %, Risk Tag).
+    UI ONLY.
     """
     if df.empty: return df
 
-    # Helper functions for mapping
+    # --- 3A: Decision Clarity Mappings ---
     def get_grade(score):
         if score >= 90: return "A+"
         elif score >= 80: return "A"
@@ -145,11 +146,35 @@ def enrich_setup_data(df):
         }
         return reasons.get(setup_type, "Technical Setup")
 
-    # Apply mappings
+    # --- 3B: Capital Intelligence Mappings ---
+    def calculate_risk_metrics(row):
+        entry = row['entry_price']
+        sl = row['stop_loss']
+        qty = row['quantity']
+        
+        risk_per_share = entry - sl
+        total_risk_rupees = risk_per_share * qty
+        risk_pct_capital = (total_risk_rupees / total_capital) * 100 if total_capital > 0 else 0
+        
+        return total_risk_rupees, risk_pct_capital
+
+    def get_risk_tag(risk_pct):
+        if risk_pct < 1.5: return "🟢 SAFE"
+        elif risk_pct <= 2.5: return "🟡 NORMAL"
+        else: return "🔴 AGGRESSIVE"
+
+    # Apply 3A Mappings
     df['Grade'] = df['confidence_score'].apply(get_grade)
     df['Confidence'] = df['Grade'].apply(get_confidence)
     df['Logic'] = df['setup_type'].apply(get_reason)
     
+    # Apply 3B Mappings
+    # Apply calculation row-wise
+    risk_data = df.apply(calculate_risk_metrics, axis=1, result_type='expand')
+    df['Risk_Rupees'] = risk_data[0]
+    df['Risk_Pct'] = risk_data[1]
+    df['Risk_Tag'] = df['Risk_Pct'].apply(get_risk_tag)
+
     return df
 
 # ========================================================
@@ -195,15 +220,26 @@ def render_dashboard(account_df, trades_df):
     is_halted = account['trading_halted']
     loss_limit_pct = account['weekly_loss_limit_pct']
 
+    # --- 3B: Capital Deployment Snapshot ---
+    pct_deployed = (deployed_cap / total_cap) * 100 if total_cap > 0 else 0
+    
+    if pct_deployed < 50:
+        exposure_status = "🟢 Comfortable"
+    elif pct_deployed <= 70:
+        exposure_status = "🟡 Moderate Exposure"
+    else:
+        exposure_status = "🔴 High Exposure (Size Down)"
+
+    # Top Row Metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1: st.metric("💰 Total Capital", format_currency(total_cap))
-    with col2: st.metric("🟢 Free Capital", format_currency(free_cap))
-    with col3: st.metric("🔴 Deployed Capital", format_currency(deployed_cap))
-    with col4:
-        status_text = "HALTED 🛑" if is_halted else "ENABLED ✅"
-        st.metric("Trading Status", status_text)
+    with col2: st.metric("🔴 Deployed Capital", format_currency(deployed_cap), delta=f"{pct_deployed:.1f}% Used", delta_color="inverse")
+    with col3: st.metric("🟢 Free Capital", format_currency(free_cap))
+    with col4: st.metric("Exposure Status", exposure_status)
 
     st.markdown("---")
+    
+    # Second Row Metrics
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Realized P&L (All Time)", format_currency(realized_pnl), delta=f"{realized_pnl:,.2f}")
     with c2: st.metric("Weekly P&L", format_currency(weekly_pnl), delta=f"{weekly_pnl:,.2f}")
@@ -231,13 +267,16 @@ def render_dashboard(account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 2: WEEKLY OPPORTUNITY BOOK (DECISION CLARITY)
+# VIEW 2: WEEKLY OPPORTUNITY BOOK (DECISION CLARITY + RISK)
 # ========================================================
 def render_opportunity_book(setups_df, account_df, trades_df):
     st.title("📅 Weekly Opportunity Book")
     start_date, end_date = get_current_week_dates()
     today_date = date.today()
     
+    # Get total capital for risk calc
+    total_capital = account_df.iloc[0]['total_capital'] if not account_df.empty else 100000
+
     st.markdown(f"#### **Trading Week:** {start_date.strftime('%d %b')} — {end_date.strftime('%d %b %Y')}")
     
     # 1. Filter for Current Week Only (Monday to Friday)
@@ -245,9 +284,10 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     if not setups_df.empty:
         setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
         current_week_setups = setups_df[setups_df['week_start_dt'] == start_date].copy()
-        # Enrich data with Decision Clarity Layer
+        
+        # Enrich data with Decision Clarity (3A) AND Capital Intelligence (3B)
         current_week_setups['confidence_score'] = pd.to_numeric(current_week_setups['confidence_score'], errors='coerce').fillna(0)
-        current_week_setups = enrich_setup_data(current_week_setups)
+        current_week_setups = enrich_setup_data(current_week_setups, total_capital)
 
     # 2. Status Banner Determination
     today_signals = pd.DataFrame()
@@ -282,16 +322,18 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     if tradr_grade.empty:
         st.caption("No high-confidence setups found this week.")
     else:
-        # Reorder columns for Decision Clarity
-        display_cols = ['ticker', 'Grade', 'Confidence', 'Logic', 'entry_price', 'stop_loss', 'target1', 'expected_move_pct', 'status']
+        # Reorder columns for Decision Clarity + Risk Transparency
+        display_cols = ['ticker', 'Grade', 'Risk_Tag', 'Logic', 'Risk_Pct', 'Risk_Rupees', 'entry_price', 'stop_loss', 'target1', 'expected_move_pct', 'status']
         st.dataframe(
             tradr_grade[display_cols],
             use_container_width=True, hide_index=True,
             column_config={
                 "ticker": "Ticker",
                 "Grade": "Grade",
-                "Confidence": "Conf.",
+                "Risk_Tag": "Risk Level",
                 "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
+                "Risk_Pct": st.column_config.NumberColumn("Risk %", format="%.2f%%"),
+                "Risk_Rupees": st.column_config.NumberColumn("Risk ₹", format="₹%.2f"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
                 "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
                 "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
@@ -307,12 +349,13 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     if alternatives.empty:
         st.caption("No alternative setups found.")
     else:
-        display_cols = ['ticker', 'Grade', 'Logic', 'entry_price', 'stop_loss', 'confidence_score', 'status']
+        display_cols = ['ticker', 'Grade', 'Risk_Tag', 'Logic', 'Risk_Pct', 'entry_price', 'stop_loss', 'confidence_score', 'status']
         st.dataframe(
             alternatives[display_cols],
             use_container_width=True, hide_index=True,
             column_config={
                 "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
+                "Risk_Pct": st.column_config.NumberColumn("Risk %", format="%.2f%%"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
                 "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
                 "confidence_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
@@ -320,11 +363,29 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION
+# VIEW 3: TRADE EXECUTION (WITH BUFFER GUARDRAIL)
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
     st.caption("Execute trades based on this week's opportunity book.")
+    
+    # --- 3B: Weekly Risk Buffer Context ---
+    # Fetch latest account state for buffer calc
+    account_df = backend_engine.get_account_state()
+    if not account_df.empty:
+        total_cap = account_df.iloc[0]['total_capital']
+        loss_limit_pct = account_df.iloc[0]['weekly_loss_limit_pct']
+        weekly_pnl = account_df.iloc[0]['weekly_pnl']
+        max_loss_amt = total_cap * (loss_limit_pct / 100.0)
+        # Adding because PnL is usually negative when losing
+        remaining_buffer = max_loss_amt + weekly_pnl 
+        if remaining_buffer < 0: remaining_buffer = 0
+        
+        st.info(f"🛡️ **Weekly Risk Guardrail:** You have **{format_currency(remaining_buffer)}** of loss allowance remaining this week.")
+    else:
+        total_cap = 100000 # Fallback
+        remaining_buffer = 2500 # Fallback
+
     st.markdown("---")
 
     mode = st.radio("Select List:", ["New Setups (Awaiting Entry)", "Active Trades (Open)"], horizontal=True)
@@ -386,7 +447,17 @@ def render_trade_execution(setups_df, trades_df):
             st.subheader("⚙️ Execution Console")
             
             if trade_source == 'setup':
+                # --- 3B: Risk Warning Check ---
+                # Calculate risk for this specific trade
+                risk_per_share = selected_trade['entry_price'] - selected_trade['stop_loss']
+                trade_risk = risk_per_share * selected_trade['quantity']
+                
                 st.info(f"💡 **Confirm Entry:** Current Price should be near {format_currency(selected_trade['entry_price'])}")
+                st.write(f"📉 **Trade Risk:** {format_currency(trade_risk)}")
+
+                if trade_risk > remaining_buffer:
+                    st.warning(f"⚠️ **WARNING:** This trade's risk ({format_currency(trade_risk)}) exceeds your remaining weekly buffer ({format_currency(remaining_buffer)}). Executing this may breach your weekly loss limit.")
+
                 col_ex1, col_ex2 = st.columns(2)
                 with col_ex1:
                     if st.button("✅ CONFIRM ENTRY TAKEN", type="primary", use_container_width=True):
@@ -533,7 +604,7 @@ if __name__ == "__main__":
             st.header("🧭 Fund Desk")
             page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
             st.divider()
-            st.caption("Virtual AI Fund Manager v1.3 (Decision Clarity)")
+            st.caption("Virtual AI Fund Manager v1.4 (Capital Intel)")
 
         if page == "Dashboard":
             render_dashboard(account_state, active_trades)
