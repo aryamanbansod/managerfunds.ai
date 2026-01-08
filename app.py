@@ -5,7 +5,8 @@ from datetime import datetime, date, timedelta
 import backend_engine  # Phase 1 Logic
 import sqlite3
 import os
-import yfinance as yf # Added for live dashboard context (read-only)
+import yfinance as yf 
+import time # Added for timestamp calculations
 
 # ========================================================
 # CONFIGURATION & CONSTANTS
@@ -128,6 +129,54 @@ def get_live_cmp(ticker):
         pass
     return None
 
+def get_scan_status_panel():
+    """Generates the Live Scan Status Panel HTML."""
+    if os.path.exists(AI_SIGNALS_PATH):
+        mtime = os.path.getmtime(AI_SIGNALS_PATH)
+        # Convert File Time (Server) to IST (UTC+5:30)
+        # Assuming server time is UTC, we add 5.5 hours. 
+        # If server is already local, this might need adjustment, but usually Cloud is UTC.
+        dt_utc = datetime.utcfromtimestamp(mtime)
+        dt_ist = dt_utc + timedelta(hours=5, minutes=30)
+        last_scan_str = dt_ist.strftime("%d %b %Y, %H:%M IST")
+        
+        # Next Scan Calculation (Approx +10 mins)
+        next_scan_dt = dt_ist + timedelta(minutes=10)
+        next_scan_str = next_scan_dt.strftime("%H:%M IST")
+        
+        # Time Remaining
+        now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        remaining = next_scan_dt - now_ist
+        if remaining.total_seconds() < 0:
+            remaining_str = "00:00 (Processing...)"
+        else:
+            mins, secs = divmod(int(remaining.total_seconds()), 60)
+            remaining_str = f"{mins:02d}:{secs:02d}"
+            
+        return f"""
+        <div style="padding: 15px; border: 1px solid #444; border-radius: 8px; background-color: #0E1117; margin-top: 10px;">
+            <h4 style="margin-top:0; color: #00FF00; display: flex; align-items: center;">
+                <span style="font-size: 1.2em; margin-right: 10px;">●</span> SYSTEM STATUS: ACTIVE
+            </h4>
+            <div style="font-family: monospace; color: #E0E0E0; font-size: 0.95em; line-height: 1.6;">
+                Last Scan&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: {last_scan_str}<br>
+                Scan Frequency : Every 10 minutes (Market & Off-Market)<br>
+                Next Scan&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: {next_scan_str}<br>
+                <span style="color: #FFD700;">⏳ Next scan in&nbsp;: {remaining_str}</span>
+            </div>
+            <hr style="margin: 12px 0; border-color: #333;">
+            <div style="color: #888; font-size: 0.9em; font-style: italic;">
+                Action: Stand down. Capital preserved.
+            </div>
+        </div>
+        """
+    else:
+        return """
+        <div style="padding: 10px; border: 1px solid #444; border-radius: 5px; background-color: #262730;">
+            <h4 style="margin:0; color: #FFA500;">⚠️ System Status: Waiting for first scan...</h4>
+        </div>
+        """
+
 # ========================================================
 # LOGIC LAYERS (3A, 3B, 3C)
 # ========================================================
@@ -135,7 +184,6 @@ def get_live_cmp(ticker):
 def determine_lifecycle_state(row):
     """Phase 3C: Maps raw data to Canonical Lifecycle States."""
     if 'trade_status' not in row: 
-        # It's a setup, not a trade
         return "AWAITING_ENTRY"
     
     status = row['trade_status']
@@ -175,7 +223,6 @@ def enrich_setup_data(df, total_capital):
     """Combines Logic from 3A (Decision) and 3B (Capital)."""
     if df.empty: return df
 
-    # 3A Mappings
     def get_grade(score):
         if score >= 90: return "A+"
         elif score >= 80: return "A"
@@ -195,7 +242,6 @@ def enrich_setup_data(df, total_capital):
         }
         return reasons.get(setup_type, "Technical Setup")
 
-    # 3B Mappings
     def calculate_risk_metrics(row):
         entry = row['entry_price']
         sl = row['stop_loss']
@@ -264,7 +310,6 @@ def render_dashboard(account_df, trades_df):
     is_halted = account['trading_halted']
     loss_limit_pct = account['weekly_loss_limit_pct']
 
-    # 3B: Capital Deployment
     pct_deployed = (deployed_cap / total_cap) * 100 if total_cap > 0 else 0
     if pct_deployed < 50: exposure_status = "🟢 Comfortable"
     elif pct_deployed <= 70: exposure_status = "🟡 Moderate Exposure"
@@ -293,7 +338,6 @@ def render_dashboard(account_df, trades_df):
     else:
         display_df = trades_df.copy()
         display_df['Days in Trade'] = display_df['entry_date'].apply(calculate_days_in_trade)
-        # 3C: Apply Lifecycle State
         display_df['Lifecycle'] = display_df.apply(determine_lifecycle_state, axis=1)
         
         final_view = display_df[['ticker', 'Lifecycle', 'entry_price', 'stop_loss', 'target1', 'target2', 'remaining_quantity', 'Days in Trade']]
@@ -330,6 +374,7 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         current_week_setups['detected_dt'] = pd.to_datetime(current_week_setups['first_detected_date']).dt.date
         today_signals = current_week_setups[current_week_setups['detected_dt'] == today_date]
 
+    # --- DECISION CLARITY BANNER & LIVE STATUS ---
     if not today_signals.empty:
         st.success("🟢 **UPL-GRADE SETUP ACTIVE — EXECUTION WINDOW OPEN**")
         st.markdown(f"**Action Required:** Review {len(today_signals)} new high-confidence setups below.")
@@ -338,8 +383,9 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         st.markdown("**Action:** Monitor existing watchlist. No new aggressive entries today.")
     else:
         st.info("🔵 **NO HIGH-CONVICTION SETUPS THIS WEEK — CAPITAL PRESERVED**")
-        st.markdown("**Action:** Stand down. Wait for next scan cycle (Daily 8:30 AM).")
-
+        # LIVE SCAN STATUS PANEL REPLACES STATIC TEXT HERE
+        st.markdown(get_scan_status_panel(), unsafe_allow_html=True)
+        
     st.markdown("---")
 
     if current_week_setups.empty:
@@ -387,12 +433,11 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION (PHASE 3C ENHANCED)
+# VIEW 3: TRADE EXECUTION
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
     
-    # --- 3C: Trade Discipline Panel ---
     active_count = 0
     runner_count = 0
     nearing_exit = 0
@@ -405,7 +450,6 @@ def render_trade_execution(setups_df, trades_df):
         runner_count = len(trades_df[trades_df['Lifecycle'] == "RUNNER ACTIVE"])
         nearing_exit = len(trades_df[trades_df['Days in Trade'] >= (MAX_HOLDING_DAYS - 5)])
     
-    # Dashboard Top Metrics
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("🔵 Active Full Positions", active_count)
     with c2: st.metric("🏃 Runners Active", runner_count)
@@ -417,7 +461,6 @@ def render_trade_execution(setups_df, trades_df):
             
     st.markdown("---")
 
-    # --- 3B: Risk Buffer (Retained) ---
     account_df = backend_engine.get_account_state()
     if not account_df.empty:
         total_cap = account_df.iloc[0]['total_capital']
@@ -475,7 +518,6 @@ def render_trade_execution(setups_df, trades_df):
                 st.metric("Quantity", selected_trade['quantity'])
                 st.caption(f"Confidence: {selected_trade.get('confidence_score', 0)}")
             else:
-                # --- 3C: Trade Lifecycle Card ---
                 days_held = calculate_days_in_trade(selected_trade['entry_date'])
                 lifecycle_state = determine_lifecycle_state(selected_trade)
                 
@@ -483,11 +525,9 @@ def render_trade_execution(setups_df, trades_df):
                 st.metric("Entry Price", format_currency(selected_trade['entry_price']))
                 st.metric("Remaining Qty", selected_trade['remaining_quantity'])
                 
-                # Timeline
                 st.write(f"**Timeline:** Day {days_held} / {MAX_HOLDING_DAYS}")
                 st.progress(min(days_held / MAX_HOLDING_DAYS, 1.0))
                 
-                # Live Context & Guidance
                 cmp = get_live_cmp(selected_trade['ticker'])
                 if cmp:
                     st.metric("Live Price (Est.)", format_currency(cmp), delta=f"{((cmp - selected_trade['entry_price'])/selected_trade['entry_price'])*100:.2f}%")
@@ -647,7 +687,7 @@ if __name__ == "__main__":
             st.header("🧭 Fund Desk")
             page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
             st.divider()
-            st.caption("Virtual AI Fund Manager v1.5 (Lifecycle)")
+            st.caption("Virtual AI Fund Manager v1.6 (Live Status)")
 
         if page == "Dashboard":
             render_dashboard(account_state, active_trades)
