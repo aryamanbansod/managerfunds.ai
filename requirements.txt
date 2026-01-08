@@ -3,5 +3,3 @@ pandas
 numpy
 plotly
 yfinance
-sqlite3
-
