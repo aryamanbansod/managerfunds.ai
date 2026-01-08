@@ -43,12 +43,15 @@ CONFIG = {
     # Volatility Gate
     "atr_lookback": 14,
     "atr_reference": 60,
-    "vol_expansion_threshold": 1.2,
+    
+    # --- CALIBRATION TUNING (UPDATED) ---
+    "vcp_tightness_threshold": 0.8,       # Relaxed from 0.7 (Allow 80% of avg width)
+    "flag_consolidation_threshold": 0.025, # Relaxed from 0.02 (Allow 2.5% daily range)
+    "accumulation_vol_threshold": 1.25,    # Sensitized from 1.5 (Catch 1.25x vol spikes)
+    "thrust_impulse_min": 0.15,            # Keep 15% thrust requirement
 
     # Unified Engine Logic
     "avg_volume_window": 20,
-    "compression_factor": 0.6,
-    "thrust_impulse_min": 0.15,
 
     # FINANCIAL FILTERS (Base)
     "min_expected_move_pct": 15.0,
@@ -200,12 +203,12 @@ def update_data(save_dir):
         return pd.DataFrame()
 
 # ==============================================================================
-# 3. CORE STRATEGY LOGIC
+# 3. CORE STRATEGY LOGIC (CALIBRATED)
 # ==============================================================================
 
 def run_unified_engine(df_prices, dirs):
-    """Runs the 5-pattern scanner logic."""
-    print("\nStep 4: Running Unified Explosive Compression Engine...")
+    """Runs the 5-pattern scanner logic with calibrated sensitivity."""
+    print("\nStep 4: Running Unified Explosive Compression Engine (Calibrated)...")
 
     if df_prices.empty:
         print("   ❌ No price data.")
@@ -232,33 +235,40 @@ def run_unified_engine(df_prices, dirs):
     df['range_pct'] = (df['High'] - df['Low']) / df['prev_close']
 
     # --- B. UNIFIED DETECTION (5 PATTERNS) ---
-    # 1. VCP
+    
+    # 1. VCP (Slightly Relaxed)
     df['rolling_std'] = g['Close'].transform(lambda x: x.rolling(20).std())
     df['bb_width'] = (4 * df['rolling_std']) / df['ema_fast']
     df['bbw_avg'] = g['bb_width'].transform(lambda x: x.rolling(40).mean())
-    is_tight = df['bb_width'] < (df['bbw_avg'] * 0.7)
+    
+    # Use calibrated threshold from CONFIG
+    is_tight = df['bb_width'] < (df['bbw_avg'] * CONFIG['vcp_tightness_threshold'])
     is_dry = df['Volume'] < df['avg_vol']
     mask_vcp = is_tight & is_dry & (df['Close'] > df['ema_inst'])
 
-    # 2. HIGH TIGHT FLAG
+    # 2. HIGH TIGHT FLAG (Consolidation Relaxed)
     has_power = df['roi_20d'].shift(5) > CONFIG['thrust_impulse_min']
-    is_consolidating = df['range_pct'].rolling(5).mean() < 0.02
+    
+    # Use calibrated threshold from CONFIG
+    is_consolidating = df['range_pct'].rolling(5).mean() < CONFIG['flag_consolidation_threshold']
     mask_flag = has_power & is_consolidating & (df['Close'] > df['ema_fast'])
 
-    # 3. NR7
+    # 3. NR7 (Standard)
     df['daily_range'] = df['High'] - df['Low']
     min_range_7 = g['daily_range'].transform(lambda x: x.rolling(7).min())
     is_nr7 = df['daily_range'] == min_range_7
     mask_nr7 = is_nr7 & (df['Close'] > df['ema_inst']) & (df['Volume'] < df['avg_vol'])
 
-    # 4. 44-MA RIDE
+    # 4. 44-MA RIDE (Standard)
     touched_ma = (df['Low'] <= df['ema_inst'] * 1.01) & (df['Low'] >= df['ema_inst'] * 0.99)
     held_ma = (df['Close'] > df['ema_inst']) & (df['Close'] > df['Open'])
     mask_44ma = touched_ma & held_ma & (df['Volume'] > df['avg_vol'])
 
-    # 5. DELIVERY ACCUMULATION
+    # 5. DELIVERY ACCUMULATION (Sensitized Volume)
     price_flat = df['Close'].pct_change().abs() < 0.01
-    vol_spike = df['Volume'] > (df['avg_vol'] * 1.5)
+    
+    # Use calibrated threshold from CONFIG (Catching 1.25x vs 1.5x)
+    vol_spike = df['Volume'] > (df['avg_vol'] * CONFIG['accumulation_vol_threshold'])
     mask_accum = price_flat & vol_spike & (df['Close'] > df['ema_inst'])
 
     # --- C. SPEED GATE ---
@@ -325,11 +335,6 @@ def smart_money_fundamental_check(ticker):
 def process_execution_gates(signals, df_prices, dirs, today_str, week_start_str, week_end_str, market_status):
     """
     Filters signals through execution gates and updates weekly memory.
-    
-    Logic:
-    - MARKET_OPEN: Allows new entries to be generated and saved to 'weekly_setups.csv'.
-    - MARKET_CLOSED: Runs analysis but prevents saving NEW aggressive entries to avoid bad data.
-      Useful for watchlist updates/fundamental checks without flooding the dashboard.
     """
     print(f"\nStep 5: Running Execution Gates in [{market_status}] Mode...")
     
@@ -413,8 +418,6 @@ def process_execution_gates(signals, df_prices, dirs, today_str, week_start_str,
     if market_status == "MARKET_CLOSED":
         print("🌙 OFF-MARKET MODE: Scanning for opportunities (Watchlist Update Only).")
         print(f"   found {len(todays_candidates)} potential candidates (Not Saving to CSV).")
-        # In Light/Off-Market mode, we do NOT append new setups to avoid data noise.
-        # We only return the candidates for printing to the console/log.
         return todays_candidates, weekly_book_df
 
     elif market_status == "MARKET_OPEN":
@@ -514,7 +517,7 @@ if __name__ == "__main__":
     # We download data regardless of mode to keep cache fresh
     df_prices = update_data(save_dir=dirs['prices'])
     
-    # 3. Run Strategy
+    # 3. Run Strategy (Calibrated)
     signals = run_unified_engine(df_prices, dirs)
     
     # 4. Process Gates & Memory (Mode Dependent)
