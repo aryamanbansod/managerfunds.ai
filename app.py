@@ -3,6 +3,7 @@
 # ==============================================================================
 # PURPOSE: Visualize the trading book, system health, and execution plans.
 # READS FROM: data/weekly/weekly_setups.csv & data/system/last_successful_scan.txt
+# ACTIONS: Triggers GitHub Actions for remote scanning (No local execution).
 # ==============================================================================
 
 import streamlit as st
@@ -10,6 +11,7 @@ import pandas as pd
 import os
 import datetime
 import pytz
+import requests
 
 # ==============================================================================
 # 1. CONFIGURATION & PAGE SETUP
@@ -21,7 +23,7 @@ st.set_page_config(
     initial_sidebar_state="collapsed"
 )
 
-# Paths (Must match ai_stock_system.py)
+# Paths (Must match ai_stock_system.py structure)
 BASE_DIR = "data"
 SYSTEM_DIR = f"{BASE_DIR}/system"
 WEEKLY_DIR = f"{BASE_DIR}/weekly"
@@ -29,7 +31,43 @@ GUARD_FILE = f"{SYSTEM_DIR}/last_successful_scan.txt"
 WEEKLY_CSV = f"{WEEKLY_DIR}/weekly_setups.csv"
 
 # ==============================================================================
-# 2. SYSTEM STATUS LOGIC (FRESHNESS-BASED)
+# 2. GITHUB TRIGGER LOGIC (MANUAL SCAN)
+# ==============================================================================
+def trigger_github_scan():
+    """
+    Triggers the GitHub Action workflow via the repository_dispatch event.
+    Requires st.secrets to be configured.
+    """
+    # 1. Fetch Secrets safely
+    try:
+        token = st.secrets["GITHUB_TOKEN"]
+        owner = st.secrets["GITHUB_OWNER"]
+        repo = st.secrets["GITHUB_REPO"]
+        event_type = st.secrets.get("GITHUB_WORKFLOW_DISPATCH_EVENT", "manual_scan_triggered")
+    except Exception:
+        st.error("❌ GitHub Secrets not found. Please configure GITHUB_TOKEN, OWNER, and REPO in Streamlit secrets.")
+        return
+
+    # 2. Prepare API Request
+    url = f"https://api.github.com/repos/{owner}/{repo}/dispatches"
+    headers = {
+        "Authorization": f"token {token}",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    payload = {"event_type": event_type}
+
+    # 3. Send Request
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        if response.status_code == 204:
+            st.success("✅ Scan request sent to GitHub. The scanner will run remotely and update results shortly.")
+        else:
+            st.error(f"❌ Failed to trigger scan. GitHub Response: {response.status_code}")
+    except Exception as e:
+        st.error(f"❌ Connection error triggering GitHub: {e}")
+
+# ==============================================================================
+# 3. SYSTEM STATUS LOGIC (FRESHNESS-BASED)
 # ==============================================================================
 def get_system_health():
     """
@@ -48,7 +86,7 @@ def get_system_health():
 
         # Parse Timestamp (Handle UTC)
         last_scan_time = datetime.datetime.fromisoformat(last_ts_str)
-        # Ensure timezone awareness for comparison
+        # Ensure timezone awareness
         if last_scan_time.tzinfo is None:
             last_scan_time = last_scan_time.replace(tzinfo=datetime.timezone.utc)
             
@@ -68,16 +106,22 @@ def get_system_health():
         return "error", f"Status check error: {str(e)}", 0, None
 
 def render_status_section():
-    """Renders the status banner and refresh button."""
+    """Renders the status banner, refresh button, and manual trigger."""
     st.markdown("### 📡 System Status")
     
-    # Layout: Status Banner on Left, Refresh Button on Right
-    col_status, col_btn = st.columns([4, 1])
+    # Layout: Status Banner (Left) | Action Buttons (Right)
+    col_status, col_actions = st.columns([3, 2])
     
-    with col_btn:
-        # UI-Only Refresh: Reruns the script to re-read files. Does NOT trigger backend scan.
-        if st.button("🔄 Refresh Status", use_container_width=True):
-            st.rerun()
+    with col_actions:
+        # Action Buttons Layout
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("🔄 Refresh UI", use_container_width=True):
+                st.rerun()
+        with c2:
+            # Manual Trigger Button
+            if st.button("🔁 Run Fresh Scan", type="primary", use_container_width=True):
+                trigger_github_scan()
 
     with col_status:
         status, msg, mins, ts_obj = get_system_health()
@@ -99,7 +143,7 @@ def render_status_section():
             
         elif status == "stale":
             st.error(f"🔴 **{msg}** {time_label}")
-            st.caption("ℹ️ Execution delayed > 1 hour. System will retry automatically via GitHub Actions.")
+            st.caption("ℹ️ Execution delayed > 1 hour. Click 'Run Fresh Scan' to force update.")
             
         elif status == "no_data":
             st.info(f"⚪ **{msg}**")
@@ -108,7 +152,7 @@ def render_status_section():
             st.error(f"❌ {msg}")
 
 # ==============================================================================
-# 3. DATA LOADING
+# 4. DATA LOADING
 # ==============================================================================
 def load_weekly_book():
     if not os.path.exists(WEEKLY_CSV):
@@ -120,7 +164,7 @@ def load_weekly_book():
         return pd.DataFrame()
 
 # ==============================================================================
-# 4. MAIN DASHBOARD UI
+# 5. MAIN DASHBOARD UI
 # ==============================================================================
 def main():
     st.title("🏦 AI Fund Manager Console")
@@ -138,7 +182,8 @@ def main():
     st.header("📖 Weekly Opportunity Book")
     
     if df.empty:
-        st.info("📭 No active setups found for this week yet. Capital is preserved.")
+        # FIX 1: Neutral message (No discipline psychology)
+        st.info("📭 No actionable setups found.")
     else:
         # Sort by Detected Date (Newest first)
         if 'Detected_Date' in df.columns:
@@ -149,10 +194,10 @@ def main():
         active_count = len(df[df['Status'] == 'ACTIVE']) if 'Status' in df.columns else len(df)
         st.metric("Active Setups in Book", active_count)
         
-        # Clean up display columns
+        # FIX 2: Removed 'Fund_Status' from display columns
         display_cols = [
             'Ticker', 'Setup', 'Entry', 'StopLoss', 'Target1', 
-            'Target2', 'Risk_Pct', 'Fund_Status', 'Status', 'Detected_Date'
+            'Target2', 'Risk_Pct', 'Status', 'Detected_Date'
         ]
         # Filter columns that actually exist in the CSV
         valid_cols = [c for c in display_cols if c in df.columns]
