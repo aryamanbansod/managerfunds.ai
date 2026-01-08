@@ -125,7 +125,6 @@ def initialize_account(initial_capital: float, weekly_loss_limit_pct: float = 2.
         ''', (initial_capital, initial_capital, weekly_loss_limit_pct, today_str))
         print(f"Account initialized with ₹{initial_capital}")
     else:
-        # Optional: Logic to hard reset if needed, for now we skip if exists
         print("Account state already exists. Skipping initialization.")
     
     conn.commit()
@@ -134,24 +133,41 @@ def initialize_account(initial_capital: float, weekly_loss_limit_pct: float = 2.
 def load_ai_weekly_setups(csv_path: str):
     """
     Loads AI Brain output CSV into the weekly_setups table.
-    Expects CSV columns to match database schema or mapping logic provided here.
+    Includes strict validation to skip invalid rows (ticker=None).
     """
     if not os.path.exists(csv_path):
         print(f"Error: CSV file {csv_path} not found.")
         return
 
-    df = pd.read_csv(csv_path)
+    # Handle empty files gracefully
+    try:
+        df = pd.read_csv(csv_path)
+        if df.empty:
+            print("CSV file is empty. Skipping import.")
+            return
+    except Exception as e:
+        print(f"Error reading CSV: {e}")
+        return
+
     conn = get_db_connection()
     cursor = conn.cursor()
     
     today_str = datetime.now().strftime("%Y-%m-%d")
     
-    # Assuming CSV has headers matching these variables. 
-    # Adjust column names in the df[...] calls if your AI brain uses different headers.
     count = 0
+    skipped = 0
+
     for _, row in df.iterrows():
         try:
-            # Upsert logic (Ignore if exists to prevent duplicates for same week)
+            # --- DATA SANITY CHECK ---
+            ticker_val = row.get('Ticker') # Note capital 'T' based on ai_stock_system.py output
+            
+            # Skip if ticker is missing, None, or NaN
+            if pd.isna(ticker_val) or str(ticker_val).strip().lower() in ['none', 'nan', '']:
+                skipped += 1
+                continue
+
+            # Upsert logic
             cursor.execute('''
             INSERT OR IGNORE INTO weekly_setups (
                 week_start_date, week_end_date, ticker, setup_type,
@@ -161,36 +177,35 @@ def load_ai_weekly_setups(csv_path: str):
                 first_detected_date, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
-                row.get('week_start_date', today_str), # Fallback if missing
-                row.get('week_end_date', '2099-12-31'),
-                row['ticker'],
-                row['setup_type'],
-                row['entry'],
-                row['stop_loss'],
-                row['target1'],
-                row['target2'],
-                int(row['quantity']),
-                row['risk_amount'],
-                row.get('expected_move_pct', 0),
-                int(row.get('est_days_tp1', 0)),
-                int(row.get('est_days_tp2', 0)),
-                row.get('confidence_score', 0),
-                today_str,
+                row.get('Week_Start', today_str), 
+                row.get('Week_End', '2099-12-31'),
+                ticker_val,
+                row.get('Setup', 'Unknown'),
+                row.get('Entry', 0.0),
+                row.get('StopLoss', 0.0),
+                row.get('Target1', 0.0),
+                row.get('Target2', 0.0),
+                0, # Quantity is calculated dynamically in dashboard usually, or 0 here
+                row.get('Risk_Pct', 0.0),
+                row.get('Exp_Move_Pct', 0),
+                int(row.get('Est_Days', 0)),
+                0, # est_days_tp2 placeholder
+                80.0, # confidence placeholder if missing
+                row.get('Detected_Date', today_str),
                 "AWAITING_ENTRY"
             ))
             count += 1
         except Exception as e:
-            print(f"Error inserting row for {row.get('ticker')}: {e}")
+            # Log valid errors, but continue
+            print(f"Error inserting row: {e}")
 
     conn.commit()
     conn.close()
-    print(f"Processed {count} setups from CSV.")
+    if count > 0 or skipped > 0:
+        print(f"Processed {count} setups. Skipped {skipped} invalid rows.")
 
 def confirm_trade_entry(setup_id: int):
-    """
-    Confirms a trade entry based on a setup.
-    Moves money from Free Capital to Deployed Capital.
-    """
+    """Confirms a trade entry based on a setup."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -218,6 +233,15 @@ def confirm_trade_entry(setup_id: int):
     tp1 = setup[7]
     tp2 = setup[8]
     qty = setup[9]
+    
+    if qty <= 0:
+        # Fallback if qty wasn't stored in setup (should be calc in UI)
+        # For safety, we reject 0 qty trades here or assume a default logic
+        # Ideally UI passes this, but sticking to Phase 1 strictness:
+        print("Error: Trade Quantity is 0. Calculate risk in UI first.")
+        conn.close()
+        return False
+        
     cost = entry_price * qty
 
     # 3. Check Capital
@@ -265,12 +289,7 @@ def confirm_trade_entry(setup_id: int):
     return True
 
 def confirm_exit_action(trade_id: int, action_type: str, exit_price: float, exited_qty: int, brokerage: float):
-    """
-    Handles TP1, TP2, SL, or TIME_EXIT.
-    Reconciles PnL and updates Capital.
-    
-    action_type options: 'TP1', 'TP2', 'SL', 'TIME_EXIT'
-    """
+    """Handles TP1, TP2, SL, or TIME_EXIT."""
     conn = get_db_connection()
     cursor = conn.cursor()
 
@@ -292,7 +311,7 @@ def confirm_exit_action(trade_id: int, action_type: str, exit_price: float, exit
     # Calculate PnL
     gross_pnl = (exit_price - entry_price) * exited_qty
     net_pnl = gross_pnl - brokerage
-    capital_released = (entry_price * exited_qty) # The original capital put in for these shares
+    capital_released = (entry_price * exited_qty)
 
     today_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -323,11 +342,6 @@ def confirm_exit_action(trade_id: int, action_type: str, exit_price: float, exit
     ''', (new_qty, new_status, trade_id))
 
     # Update Account State
-    # Free Capital increases by (Capital Released + Net PnL)
-    # Deployed Capital decreases by Capital Released
-    # Realized PnL increases by Net PnL
-    # Weekly PnL increases by Net PnL
-    
     cursor.execute('''
     UPDATE account_state 
     SET free_capital = free_capital + ? + ?,
@@ -354,7 +368,7 @@ def enforce_weekly_loss_cap(conn):
     if not row: return
 
     total_cap, weekly_pnl, limit_pct = row
-    max_loss_amount = total_cap * (limit_pct / 100.0) * -1 # Make negative
+    max_loss_amount = total_cap * (limit_pct / 100.0) * -1 
 
     if weekly_pnl <= max_loss_amount:
         cursor.execute("UPDATE account_state SET trading_halted=1 WHERE id=1")
@@ -383,11 +397,6 @@ def get_weekly_setups():
     conn.close()
     return df
 
-# ========================================================
-# EXECUTION ENTRY POINT
-# ========================================================
 if __name__ == "__main__":
     init_db()
-    # Example initialization (Uncomment to test)
-    # initialize_account(100000)
     print("Backend Engine is Ready.")

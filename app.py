@@ -6,7 +6,7 @@ import backend_engine  # Phase 1 Logic
 import sqlite3
 import os
 import yfinance as yf 
-import time # Added for timestamp calculations
+import time
 
 # ========================================================
 # CONFIGURATION & CONSTANTS
@@ -130,12 +130,10 @@ def get_live_cmp(ticker):
     return None
 
 def get_scan_status_panel():
-    """Generates the Live Scan Status Panel HTML."""
+    """Generates the Live Scan Status Panel HTML with Delay Logic."""
     if os.path.exists(AI_SIGNALS_PATH):
         mtime = os.path.getmtime(AI_SIGNALS_PATH)
         # Convert File Time (Server) to IST (UTC+5:30)
-        # Assuming server time is UTC, we add 5.5 hours. 
-        # If server is already local, this might need adjustment, but usually Cloud is UTC.
         dt_utc = datetime.utcfromtimestamp(mtime)
         dt_ist = dt_utc + timedelta(hours=5, minutes=30)
         last_scan_str = dt_ist.strftime("%d %b %Y, %H:%M IST")
@@ -144,14 +142,25 @@ def get_scan_status_panel():
         next_scan_dt = dt_ist + timedelta(minutes=10)
         next_scan_str = next_scan_dt.strftime("%H:%M IST")
         
-        # Time Remaining
+        # Current Time in IST
         now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
         remaining = next_scan_dt - now_ist
-        if remaining.total_seconds() < 0:
-            remaining_str = "00:00 (Processing...)"
+        
+        # --- ROBUSTNESS FIX ---
+        # If remaining is less than -3 minutes (i.e. > 3 mins late), show delayed status
+        is_delayed = remaining.total_seconds() < -180
+        
+        if is_delayed:
+             time_display = f"<span style='color: #FFA500; font-weight: bold;'>⚠️ Scan delayed (GitHub queue)</span>"
+             sub_text = "GitHub Actions often queue jobs. Data will update automatically on completion."
+        elif remaining.total_seconds() < 0:
+            time_display = "<span style='color: #888;'>00:00 (Processing...)</span>"
+            sub_text = "Action: Stand down. Capital preserved."
         else:
             mins, secs = divmod(int(remaining.total_seconds()), 60)
             remaining_str = f"{mins:02d}:{secs:02d}"
+            time_display = f"<span style='color: #FFD700;'>⏳ Next scan in&nbsp;: {remaining_str}</span>"
+            sub_text = "Action: Stand down. Capital preserved."
             
         return f"""
         <div style="padding: 15px; border: 1px solid #444; border-radius: 8px; background-color: #0E1117; margin-top: 10px;">
@@ -162,11 +171,11 @@ def get_scan_status_panel():
                 Last Scan&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: {last_scan_str}<br>
                 Scan Frequency : Every 10 minutes (Market & Off-Market)<br>
                 Next Scan&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;: {next_scan_str}<br>
-                <span style="color: #FFD700;">⏳ Next scan in&nbsp;: {remaining_str}</span>
+                {time_display}
             </div>
             <hr style="margin: 12px 0; border-color: #333;">
             <div style="color: #888; font-size: 0.9em; font-style: italic;">
-                Action: Stand down. Capital preserved.
+                {sub_text}
             </div>
         </div>
         """
@@ -310,6 +319,7 @@ def render_dashboard(account_df, trades_df):
     is_halted = account['trading_halted']
     loss_limit_pct = account['weekly_loss_limit_pct']
 
+    # 3B: Capital Deployment
     pct_deployed = (deployed_cap / total_cap) * 100 if total_cap > 0 else 0
     if pct_deployed < 50: exposure_status = "🟢 Comfortable"
     elif pct_deployed <= 70: exposure_status = "🟡 Moderate Exposure"
@@ -338,6 +348,7 @@ def render_dashboard(account_df, trades_df):
     else:
         display_df = trades_df.copy()
         display_df['Days in Trade'] = display_df['entry_date'].apply(calculate_days_in_trade)
+        # 3C: Apply Lifecycle State
         display_df['Lifecycle'] = display_df.apply(determine_lifecycle_state, axis=1)
         
         final_view = display_df[['ticker', 'Lifecycle', 'entry_price', 'stop_loss', 'target1', 'target2', 'remaining_quantity', 'Days in Trade']]
@@ -433,7 +444,7 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION
+# VIEW 3: TRADE EXECUTION (PHASE 3C ENHANCED)
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
@@ -461,6 +472,7 @@ def render_trade_execution(setups_df, trades_df):
             
     st.markdown("---")
 
+    # --- 3B: Risk Buffer (Retained) ---
     account_df = backend_engine.get_account_state()
     if not account_df.empty:
         total_cap = account_df.iloc[0]['total_capital']
@@ -687,7 +699,7 @@ if __name__ == "__main__":
             st.header("🧭 Fund Desk")
             page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
             st.divider()
-            st.caption("Virtual AI Fund Manager v1.6 (Live Status)")
+            st.caption("Virtual AI Fund Manager v1.7 (Robust)")
 
         if page == "Dashboard":
             render_dashboard(account_state, active_trades)
