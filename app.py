@@ -17,9 +17,8 @@ st.set_page_config(
 )
 
 # Path to the AI Brain's output CSV
-# GitHub Actions saves it here. Ensure this path matches your repo structure.
 AI_SIGNALS_PATH = "data/signals/smart_money_tradr_signals.csv" 
-CONFIDENCE_THRESHOLD = 90.0 # Score to be considered "TRADR-GRADE"
+CONFIDENCE_THRESHOLD = 90.0 # Score to be considered "TRADR-GRADE" (A+)
 
 # ========================================================
 # DATABASE & INITIALIZATION CHECKS
@@ -117,6 +116,43 @@ def skip_setup(setup_id):
     conn.close()
 
 # ========================================================
+# DECISION CLARITY LOGIC (PHASE 3A)
+# ========================================================
+def enrich_setup_data(df):
+    """
+    Adds Decision Clarity fields (Grade, Confidence, Logic) 
+    derived from existing technical data. UI ONLY.
+    """
+    if df.empty: return df
+
+    # Helper functions for mapping
+    def get_grade(score):
+        if score >= 90: return "A+"
+        elif score >= 80: return "A"
+        return "B"
+    
+    def get_confidence(grade):
+        if grade in ["A+", "A"]: return "High"
+        return "Medium"
+        
+    def get_reason(setup_type):
+        reasons = {
+            "VCP_COMPRESSION": "Volatility contraction + Vol dry-up",
+            "HIGH_TIGHT_FLAG": "Momentum thrust + Tight consolidation",
+            "NR7_CONTRACTION": "Extreme range contraction (Imminent Move)",
+            "44MA_SUPPORT_BUY": "Institutional support pullback",
+            "ACCUMULATION_SPIKE": "Institutional volume spike (Ignition)"
+        }
+        return reasons.get(setup_type, "Technical Setup")
+
+    # Apply mappings
+    df['Grade'] = df['confidence_score'].apply(get_grade)
+    df['Confidence'] = df['Grade'].apply(get_confidence)
+    df['Logic'] = df['setup_type'].apply(get_reason)
+    
+    return df
+
+# ========================================================
 # VIEW: INITIALIZATION SCREEN
 # ========================================================
 def render_initialization_screen():
@@ -195,7 +231,7 @@ def render_dashboard(account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 2: WEEKLY OPPORTUNITY BOOK (WIRED)
+# VIEW 2: WEEKLY OPPORTUNITY BOOK (DECISION CLARITY)
 # ========================================================
 def render_opportunity_book(setups_df, account_df, trades_df):
     st.title("📅 Weekly Opportunity Book")
@@ -205,87 +241,86 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     st.markdown(f"#### **Trading Week:** {start_date.strftime('%d %b')} — {end_date.strftime('%d %b %Y')}")
     
     # 1. Filter for Current Week Only (Monday to Friday)
+    current_week_setups = pd.DataFrame()
     if not setups_df.empty:
-        # Convert week_start_date in DB to date object
         setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
         current_week_setups = setups_df[setups_df['week_start_dt'] == start_date].copy()
-    else:
-        current_week_setups = pd.DataFrame()
+        # Enrich data with Decision Clarity Layer
+        current_week_setups['confidence_score'] = pd.to_numeric(current_week_setups['confidence_score'], errors='coerce').fillna(0)
+        current_week_setups = enrich_setup_data(current_week_setups)
 
-    if current_week_setups.empty:
-        st.info("💤 No setups detected for this week yet. The AI scanner runs daily at 8:30 AM.")
-        st.caption(f"Waiting for signals from: {AI_SIGNALS_PATH}")
-        return
+    # 2. Status Banner Determination
+    today_signals = pd.DataFrame()
+    if not current_week_setups.empty:
+        current_week_setups['detected_dt'] = pd.to_datetime(current_week_setups['first_detected_date']).dt.date
+        today_signals = current_week_setups[current_week_setups['detected_dt'] == today_date]
 
-    # 2. Check for "Actionable Today"
-    # We check if 'first_detected_date' matches today
-    current_week_setups['detected_dt'] = pd.to_datetime(current_week_setups['first_detected_date']).dt.date
-    today_signals = current_week_setups[current_week_setups['detected_dt'] == today_date]
-    
+    # --- DECISION CLARITY BANNER ---
     if not today_signals.empty:
-        st.success(f"🚀 **ACTIONABLE TODAY:** {len(today_signals)} New Signal(s) Detected!")
+        st.success("🟢 **UPL-GRADE SETUP ACTIVE — EXECUTION WINDOW OPEN**")
+        st.markdown(f"**Action Required:** Review {len(today_signals)} new high-confidence setups below.")
+    elif not current_week_setups.empty:
+        st.warning("🟡 **NO NEW SETUP TODAY — WEEKLY SCAN ACTIVE**")
+        st.markdown("**Action:** Monitor existing watchlist. No new aggressive entries today.")
     else:
-        st.info("❌ No new setups generated today. Showing active setups from earlier this week.")
+        st.info("🔵 **NO HIGH-CONVICTION SETUPS THIS WEEK — CAPITAL PRESERVED**")
+        st.markdown("**Action:** Stand down. Wait for next scan cycle (Daily 8:30 AM).")
+    # -------------------------------
 
     st.markdown("---")
 
+    if current_week_setups.empty:
+        return
+
     # 3. Categorize & Display
-    # Ensure confidence_score is numeric
-    current_week_setups['confidence_score'] = pd.to_numeric(current_week_setups['confidence_score'], errors='coerce').fillna(0)
-    
-    def determine_grade(score):
-        return "🚀 TRADR-GRADE" if score >= CONFIDENCE_THRESHOLD else "⚠️ ALTERNATIVE"
+    # Separate Lists based on Grade
+    tradr_grade = current_week_setups[current_week_setups['Grade'].isin(["A+", "A"])]
+    alternatives = current_week_setups[current_week_setups['Grade'] == "B"]
 
-    current_week_setups['Grade'] = current_week_setups['confidence_score'].apply(determine_grade)
-
-    # Separate Lists
-    tradr_grade = current_week_setups[current_week_setups['Grade'] == "🚀 TRADR-GRADE"]
-    alternatives = current_week_setups[current_week_setups['Grade'] == "⚠️ ALTERNATIVE"]
-
-    # --- SECTION A: TRADR-GRADE ---
-    st.subheader("🚀 High-Confidence Setups (TRADR-GRADE)")
+    # --- SECTION A: HIGH CONVICTION ---
+    st.subheader("🚀 High-Confidence Setups (A+ / A)")
     if tradr_grade.empty:
         st.caption("No high-confidence setups found this week.")
     else:
-        display_cols = ['ticker', 'setup_type', 'entry_price', 'stop_loss', 'target1', 'target2', 'expected_move_pct', 'confidence_score', 'first_detected_date', 'status']
+        # Reorder columns for Decision Clarity
+        display_cols = ['ticker', 'Grade', 'Confidence', 'Logic', 'entry_price', 'stop_loss', 'target1', 'expected_move_pct', 'status']
         st.dataframe(
             tradr_grade[display_cols],
             use_container_width=True, hide_index=True,
             column_config={
                 "ticker": "Ticker",
-                "setup_type": "Pattern",
+                "Grade": "Grade",
+                "Confidence": "Conf.",
+                "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
                 "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
                 "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
-                "target2": st.column_config.NumberColumn("TP2", format="₹%.2f"),
                 "expected_move_pct": st.column_config.NumberColumn("Pot. ROI", format="%.1f%%"),
-                "confidence_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
-                "first_detected_date": "Detected",
                 "status": st.column_config.TextColumn("Status"),
             }
         )
 
     st.markdown("---")
 
-    # --- SECTION B: ALTERNATIVES ---
-    st.subheader("⚠️ Alternative Setups (Watchlist)")
+    # --- SECTION B: WATCHLIST ---
+    st.subheader("⚠️ Alternative Setups (Grade B)")
     if alternatives.empty:
         st.caption("No alternative setups found.")
     else:
-        display_cols = ['ticker', 'setup_type', 'entry_price', 'stop_loss', 'target1', 'confidence_score', 'first_detected_date', 'status']
+        display_cols = ['ticker', 'Grade', 'Logic', 'entry_price', 'stop_loss', 'confidence_score', 'status']
         st.dataframe(
             alternatives[display_cols],
             use_container_width=True, hide_index=True,
             column_config={
+                "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
                 "entry_price": st.column_config.NumberColumn("Entry", format="₹%.2f"),
                 "stop_loss": st.column_config.NumberColumn("SL", format="₹%.2f"),
-                "target1": st.column_config.NumberColumn("TP1", format="₹%.2f"),
                 "confidence_score": st.column_config.ProgressColumn("Score", min_value=0, max_value=100, format="%d"),
             }
         )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION (WIRED)
+# VIEW 3: TRADE EXECUTION
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
@@ -297,7 +332,6 @@ def render_trade_execution(setups_df, trades_df):
     trade_source = None 
 
     if mode == "New Setups (Awaiting Entry)":
-        # FILTER: Show only setups from current week that are 'AWAITING_ENTRY'
         start_date, end_date = get_current_week_dates()
         
         if setups_df.empty:
@@ -305,7 +339,6 @@ def render_trade_execution(setups_df, trades_df):
             candidates = pd.DataFrame()
         else:
             setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
-            # Filter: Current Week AND Status is Awaiting
             candidates = setups_df[
                 (setups_df['week_start_dt'] == start_date) & 
                 (setups_df['status'] == 'AWAITING_ENTRY')
@@ -500,7 +533,7 @@ if __name__ == "__main__":
             st.header("🧭 Fund Desk")
             page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
             st.divider()
-            st.caption("Virtual AI Fund Manager v1.2 (Live Wired)")
+            st.caption("Virtual AI Fund Manager v1.3 (Decision Clarity)")
 
         if page == "Dashboard":
             render_dashboard(account_state, active_trades)
