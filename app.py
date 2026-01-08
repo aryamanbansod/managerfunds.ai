@@ -5,6 +5,7 @@ from datetime import datetime, date, timedelta
 import backend_engine  # Phase 1 Logic
 import sqlite3
 import os
+import yfinance as yf # Added for live dashboard context (read-only)
 
 # ========================================================
 # CONFIGURATION & CONSTANTS
@@ -19,6 +20,7 @@ st.set_page_config(
 # Path to the AI Brain's output CSV
 AI_SIGNALS_PATH = "data/signals/smart_money_tradr_signals.csv" 
 CONFIDENCE_THRESHOLD = 90.0 # Score to be considered "TRADR-GRADE" (A+)
+MAX_HOLDING_DAYS = 20
 
 # ========================================================
 # DATABASE & INITIALIZATION CHECKS
@@ -115,18 +117,65 @@ def skip_setup(setup_id):
     conn.commit()
     conn.close()
 
+def get_live_cmp(ticker):
+    """Fetches live CMP from yfinance for dashboard context (Read-Only)."""
+    try:
+        ticker_obj = yf.Ticker(ticker)
+        data = ticker_obj.history(period="1d")
+        if not data.empty:
+            return data['Close'].iloc[-1]
+    except:
+        pass
+    return None
+
 # ========================================================
-# DECISION & CAPITAL INTELLIGENCE LOGIC (PHASE 3A + 3B)
+# LOGIC LAYERS (3A, 3B, 3C)
 # ========================================================
+
+def determine_lifecycle_state(row):
+    """Phase 3C: Maps raw data to Canonical Lifecycle States."""
+    if 'trade_status' not in row: 
+        # It's a setup, not a trade
+        return "AWAITING_ENTRY"
+    
+    status = row['trade_status']
+    initial_qty = row['initial_quantity']
+    rem_qty = row['remaining_quantity']
+    
+    if status == 'CLOSED':
+        return "EXITED"
+    elif status == 'ACTIVE':
+        if rem_qty == initial_qty:
+            return "ACTIVE (Full Position)"
+        elif rem_qty < initial_qty and rem_qty > 0:
+            return "RUNNER ACTIVE"
+    return "UNKNOWN"
+
+def get_guided_exit_message(row, cmp):
+    """Phase 3C: Generates context-aware guidance."""
+    state = determine_lifecycle_state(row)
+    
+    if state == "ACTIVE (Full Position)":
+        if cmp and cmp >= row['target1']:
+            return "🎯 **TP1 LEVEL REACHED:** Plan suggests booking partial profits (50%)."
+        elif cmp and cmp <= row['stop_loss']:
+            return "❌ **SL CONDITION MET:** Discipline check. Confirm exit if valid."
+        else:
+            return "🔵 **HOLDING:** Monitoring for TP1 or SL."
+            
+    elif state == "RUNNER ACTIVE":
+        if cmp and cmp >= row['target2']:
+            return "🚀 **TP2 LEVEL REACHED:** Plan suggests fully closing the trade."
+        else:
+            return "🏃 **RUNNER ACTIVE:** SL should be at Breakeven. Hold for expansion."
+            
+    return "⚪ Awaiting Price Action."
+
 def enrich_setup_data(df, total_capital):
-    """
-    Adds Decision Clarity fields (Grade, Confidence, Logic) 
-    AND Capital Intelligence fields (Risk ₹, Risk %, Risk Tag).
-    UI ONLY.
-    """
+    """Combines Logic from 3A (Decision) and 3B (Capital)."""
     if df.empty: return df
 
-    # --- 3A: Decision Clarity Mappings ---
+    # 3A Mappings
     def get_grade(score):
         if score >= 90: return "A+"
         elif score >= 80: return "A"
@@ -146,16 +195,14 @@ def enrich_setup_data(df, total_capital):
         }
         return reasons.get(setup_type, "Technical Setup")
 
-    # --- 3B: Capital Intelligence Mappings ---
+    # 3B Mappings
     def calculate_risk_metrics(row):
         entry = row['entry_price']
         sl = row['stop_loss']
         qty = row['quantity']
-        
         risk_per_share = entry - sl
         total_risk_rupees = risk_per_share * qty
         risk_pct_capital = (total_risk_rupees / total_capital) * 100 if total_capital > 0 else 0
-        
         return total_risk_rupees, risk_pct_capital
 
     def get_risk_tag(risk_pct):
@@ -163,13 +210,10 @@ def enrich_setup_data(df, total_capital):
         elif risk_pct <= 2.5: return "🟡 NORMAL"
         else: return "🔴 AGGRESSIVE"
 
-    # Apply 3A Mappings
     df['Grade'] = df['confidence_score'].apply(get_grade)
     df['Confidence'] = df['Grade'].apply(get_confidence)
     df['Logic'] = df['setup_type'].apply(get_reason)
     
-    # Apply 3B Mappings
-    # Apply calculation row-wise
     risk_data = df.apply(calculate_risk_metrics, axis=1, result_type='expand')
     df['Risk_Rupees'] = risk_data[0]
     df['Risk_Pct'] = risk_data[1]
@@ -220,17 +264,12 @@ def render_dashboard(account_df, trades_df):
     is_halted = account['trading_halted']
     loss_limit_pct = account['weekly_loss_limit_pct']
 
-    # --- 3B: Capital Deployment Snapshot ---
+    # 3B: Capital Deployment
     pct_deployed = (deployed_cap / total_cap) * 100 if total_cap > 0 else 0
-    
-    if pct_deployed < 50:
-        exposure_status = "🟢 Comfortable"
-    elif pct_deployed <= 70:
-        exposure_status = "🟡 Moderate Exposure"
-    else:
-        exposure_status = "🔴 High Exposure (Size Down)"
+    if pct_deployed < 50: exposure_status = "🟢 Comfortable"
+    elif pct_deployed <= 70: exposure_status = "🟡 Moderate Exposure"
+    else: exposure_status = "🔴 High Exposure (Size Down)"
 
-    # Top Row Metrics
     col1, col2, col3, col4 = st.columns(4)
     with col1: st.metric("💰 Total Capital", format_currency(total_cap))
     with col2: st.metric("🔴 Deployed Capital", format_currency(deployed_cap), delta=f"{pct_deployed:.1f}% Used", delta_color="inverse")
@@ -239,7 +278,6 @@ def render_dashboard(account_df, trades_df):
 
     st.markdown("---")
     
-    # Second Row Metrics
     c1, c2, c3 = st.columns(3)
     with c1: st.metric("Realized P&L (All Time)", format_currency(realized_pnl), delta=f"{realized_pnl:,.2f}")
     with c2: st.metric("Weekly P&L", format_currency(weekly_pnl), delta=f"{weekly_pnl:,.2f}")
@@ -255,7 +293,10 @@ def render_dashboard(account_df, trades_df):
     else:
         display_df = trades_df.copy()
         display_df['Days in Trade'] = display_df['entry_date'].apply(calculate_days_in_trade)
-        final_view = display_df[['ticker', 'trade_status', 'entry_price', 'stop_loss', 'target1', 'target2', 'initial_quantity', 'remaining_quantity', 'Days in Trade']]
+        # 3C: Apply Lifecycle State
+        display_df['Lifecycle'] = display_df.apply(determine_lifecycle_state, axis=1)
+        
+        final_view = display_df[['ticker', 'Lifecycle', 'entry_price', 'stop_loss', 'target1', 'target2', 'remaining_quantity', 'Days in Trade']]
         st.dataframe(
             final_view, use_container_width=True, hide_index=True,
             column_config={
@@ -267,35 +308,28 @@ def render_dashboard(account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 2: WEEKLY OPPORTUNITY BOOK (DECISION CLARITY + RISK)
+# VIEW 2: WEEKLY OPPORTUNITY BOOK
 # ========================================================
 def render_opportunity_book(setups_df, account_df, trades_df):
     st.title("📅 Weekly Opportunity Book")
     start_date, end_date = get_current_week_dates()
     today_date = date.today()
-    
-    # Get total capital for risk calc
     total_capital = account_df.iloc[0]['total_capital'] if not account_df.empty else 100000
 
     st.markdown(f"#### **Trading Week:** {start_date.strftime('%d %b')} — {end_date.strftime('%d %b %Y')}")
     
-    # 1. Filter for Current Week Only (Monday to Friday)
     current_week_setups = pd.DataFrame()
     if not setups_df.empty:
         setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
         current_week_setups = setups_df[setups_df['week_start_dt'] == start_date].copy()
-        
-        # Enrich data with Decision Clarity (3A) AND Capital Intelligence (3B)
         current_week_setups['confidence_score'] = pd.to_numeric(current_week_setups['confidence_score'], errors='coerce').fillna(0)
         current_week_setups = enrich_setup_data(current_week_setups, total_capital)
 
-    # 2. Status Banner Determination
     today_signals = pd.DataFrame()
     if not current_week_setups.empty:
         current_week_setups['detected_dt'] = pd.to_datetime(current_week_setups['first_detected_date']).dt.date
         today_signals = current_week_setups[current_week_setups['detected_dt'] == today_date]
 
-    # --- DECISION CLARITY BANNER ---
     if not today_signals.empty:
         st.success("🟢 **UPL-GRADE SETUP ACTIVE — EXECUTION WINDOW OPEN**")
         st.markdown(f"**Action Required:** Review {len(today_signals)} new high-confidence setups below.")
@@ -305,32 +339,24 @@ def render_opportunity_book(setups_df, account_df, trades_df):
     else:
         st.info("🔵 **NO HIGH-CONVICTION SETUPS THIS WEEK — CAPITAL PRESERVED**")
         st.markdown("**Action:** Stand down. Wait for next scan cycle (Daily 8:30 AM).")
-    # -------------------------------
 
     st.markdown("---")
 
     if current_week_setups.empty:
         return
 
-    # 3. Categorize & Display
-    # Separate Lists based on Grade
     tradr_grade = current_week_setups[current_week_setups['Grade'].isin(["A+", "A"])]
     alternatives = current_week_setups[current_week_setups['Grade'] == "B"]
 
-    # --- SECTION A: HIGH CONVICTION ---
     st.subheader("🚀 High-Confidence Setups (A+ / A)")
     if tradr_grade.empty:
         st.caption("No high-confidence setups found this week.")
     else:
-        # Reorder columns for Decision Clarity + Risk Transparency
         display_cols = ['ticker', 'Grade', 'Risk_Tag', 'Logic', 'Risk_Pct', 'Risk_Rupees', 'entry_price', 'stop_loss', 'target1', 'expected_move_pct', 'status']
         st.dataframe(
-            tradr_grade[display_cols],
-            use_container_width=True, hide_index=True,
+            tradr_grade[display_cols], use_container_width=True, hide_index=True,
             column_config={
-                "ticker": "Ticker",
-                "Grade": "Grade",
-                "Risk_Tag": "Risk Level",
+                "ticker": "Ticker", "Grade": "Grade", "Risk_Tag": "Risk Level",
                 "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
                 "Risk_Pct": st.column_config.NumberColumn("Risk %", format="%.2f%%"),
                 "Risk_Rupees": st.column_config.NumberColumn("Risk ₹", format="₹%.2f"),
@@ -344,15 +370,13 @@ def render_opportunity_book(setups_df, account_df, trades_df):
 
     st.markdown("---")
 
-    # --- SECTION B: WATCHLIST ---
     st.subheader("⚠️ Alternative Setups (Grade B)")
     if alternatives.empty:
         st.caption("No alternative setups found.")
     else:
         display_cols = ['ticker', 'Grade', 'Risk_Tag', 'Logic', 'Risk_Pct', 'entry_price', 'stop_loss', 'confidence_score', 'status']
         st.dataframe(
-            alternatives[display_cols],
-            use_container_width=True, hide_index=True,
+            alternatives[display_cols], use_container_width=True, hide_index=True,
             column_config={
                 "Logic": st.column_config.TextColumn("Why This Exists", width="medium"),
                 "Risk_Pct": st.column_config.NumberColumn("Risk %", format="%.2f%%"),
@@ -363,30 +387,47 @@ def render_opportunity_book(setups_df, account_df, trades_df):
         )
 
 # ========================================================
-# VIEW 3: TRADE EXECUTION (WITH BUFFER GUARDRAIL)
+# VIEW 3: TRADE EXECUTION (PHASE 3C ENHANCED)
 # ========================================================
 def render_trade_execution(setups_df, trades_df):
     st.title("⚡ Trade Execution Desk")
-    st.caption("Execute trades based on this week's opportunity book.")
     
-    # --- 3B: Weekly Risk Buffer Context ---
-    # Fetch latest account state for buffer calc
+    # --- 3C: Trade Discipline Panel ---
+    active_count = 0
+    runner_count = 0
+    nearing_exit = 0
+    
+    if not trades_df.empty:
+        trades_df['Lifecycle'] = trades_df.apply(determine_lifecycle_state, axis=1)
+        trades_df['Days in Trade'] = trades_df['entry_date'].apply(calculate_days_in_trade)
+        
+        active_count = len(trades_df[trades_df['Lifecycle'] == "ACTIVE (Full Position)"])
+        runner_count = len(trades_df[trades_df['Lifecycle'] == "RUNNER ACTIVE"])
+        nearing_exit = len(trades_df[trades_df['Days in Trade'] >= (MAX_HOLDING_DAYS - 5)])
+    
+    # Dashboard Top Metrics
+    c1, c2, c3 = st.columns(3)
+    with c1: st.metric("🔵 Active Full Positions", active_count)
+    with c2: st.metric("🏃 Runners Active", runner_count)
+    with c3: 
+        if nearing_exit > 0:
+            st.metric("⏳ Nearing Time Exit", nearing_exit, delta="Action Needed", delta_color="inverse")
+        else:
+            st.metric("⏳ Nearing Time Exit", 0)
+            
+    st.markdown("---")
+
+    # --- 3B: Risk Buffer (Retained) ---
     account_df = backend_engine.get_account_state()
     if not account_df.empty:
         total_cap = account_df.iloc[0]['total_capital']
         loss_limit_pct = account_df.iloc[0]['weekly_loss_limit_pct']
         weekly_pnl = account_df.iloc[0]['weekly_pnl']
         max_loss_amt = total_cap * (loss_limit_pct / 100.0)
-        # Adding because PnL is usually negative when losing
         remaining_buffer = max_loss_amt + weekly_pnl 
         if remaining_buffer < 0: remaining_buffer = 0
-        
-        st.info(f"🛡️ **Weekly Risk Guardrail:** You have **{format_currency(remaining_buffer)}** of loss allowance remaining this week.")
     else:
-        total_cap = 100000 # Fallback
-        remaining_buffer = 2500 # Fallback
-
-    st.markdown("---")
+        remaining_buffer = 2500
 
     mode = st.radio("Select List:", ["New Setups (Awaiting Entry)", "Active Trades (Open)"], horizontal=True)
     selected_trade = None
@@ -394,16 +435,12 @@ def render_trade_execution(setups_df, trades_df):
 
     if mode == "New Setups (Awaiting Entry)":
         start_date, end_date = get_current_week_dates()
-        
         if setups_df.empty:
             st.info("No setups loaded.")
             candidates = pd.DataFrame()
         else:
             setups_df['week_start_dt'] = pd.to_datetime(setups_df['week_start_date']).dt.date
-            candidates = setups_df[
-                (setups_df['week_start_dt'] == start_date) & 
-                (setups_df['status'] == 'AWAITING_ENTRY')
-            ]
+            candidates = setups_df[(setups_df['week_start_dt'] == start_date) & (setups_df['status'] == 'AWAITING_ENTRY')]
 
         if candidates.empty:
             st.info("No actionable setups awaiting entry for this week.")
@@ -438,25 +475,36 @@ def render_trade_execution(setups_df, trades_df):
                 st.metric("Quantity", selected_trade['quantity'])
                 st.caption(f"Confidence: {selected_trade.get('confidence_score', 0)}")
             else:
-                st.caption(f"Status: {selected_trade['trade_status']}")
+                # --- 3C: Trade Lifecycle Card ---
+                days_held = calculate_days_in_trade(selected_trade['entry_date'])
+                lifecycle_state = determine_lifecycle_state(selected_trade)
+                
+                st.caption(f"State: **{lifecycle_state}**")
                 st.metric("Entry Price", format_currency(selected_trade['entry_price']))
-                st.metric("Current SL", format_currency(selected_trade['stop_loss']))
                 st.metric("Remaining Qty", selected_trade['remaining_quantity'])
-        
+                
+                # Timeline
+                st.write(f"**Timeline:** Day {days_held} / {MAX_HOLDING_DAYS}")
+                st.progress(min(days_held / MAX_HOLDING_DAYS, 1.0))
+                
+                # Live Context & Guidance
+                cmp = get_live_cmp(selected_trade['ticker'])
+                if cmp:
+                    st.metric("Live Price (Est.)", format_currency(cmp), delta=f"{((cmp - selected_trade['entry_price'])/selected_trade['entry_price'])*100:.2f}%")
+                
+                guidance = get_guided_exit_message(selected_trade, cmp)
+                st.info(guidance)
+
         with c2:
             st.subheader("⚙️ Execution Console")
             
             if trade_source == 'setup':
-                # --- 3B: Risk Warning Check ---
-                # Calculate risk for this specific trade
                 risk_per_share = selected_trade['entry_price'] - selected_trade['stop_loss']
                 trade_risk = risk_per_share * selected_trade['quantity']
-                
                 st.info(f"💡 **Confirm Entry:** Current Price should be near {format_currency(selected_trade['entry_price'])}")
                 st.write(f"📉 **Trade Risk:** {format_currency(trade_risk)}")
-
                 if trade_risk > remaining_buffer:
-                    st.warning(f"⚠️ **WARNING:** This trade's risk ({format_currency(trade_risk)}) exceeds your remaining weekly buffer ({format_currency(remaining_buffer)}). Executing this may breach your weekly loss limit.")
+                    st.warning(f"⚠️ **WARNING:** Risk ({format_currency(trade_risk)}) > Buffer ({format_currency(remaining_buffer)}).")
 
                 col_ex1, col_ex2 = st.columns(2)
                 with col_ex1:
@@ -465,12 +513,10 @@ def render_trade_execution(setups_df, trades_df):
                         if success:
                             st.success(f"Trade for {selected_trade['ticker']} ACTIVATED!")
                             st.rerun()
-                        else:
-                            st.error("Entry failed. Check capital or logic.")
                 with col_ex2:
                     if st.button("❌ SKIP TRADE", use_container_width=True):
                         skip_setup(int(selected_trade['id']))
-                        st.warning(f"Trade for {selected_trade['ticker']} marked as SKIPPED.")
+                        st.warning("Skipped.")
                         st.rerun()
 
             elif trade_source == 'trade':
@@ -486,9 +532,8 @@ def render_trade_execution(setups_df, trades_df):
                     brokerage = st.number_input("Total Brokerage & Charges (₹)", min_value=0.0, step=10.0)
                     if st.button("Confirm TP1 Booking"):
                         backend_engine.confirm_exit_action(trade_id, "TP1", exit_price, exit_qty, brokerage)
-                        st.success("TP1 Booked. SL moved to Breakeven.")
+                        st.success("TP1 Booked.")
                         st.rerun()
-
                 elif action == "🎯 Book Target 2":
                     st.markdown("#### TP2 Execution (Final)")
                     exit_qty = st.number_input("Quantity Exited", min_value=1, max_value=current_qty, value=current_qty)
@@ -496,9 +541,8 @@ def render_trade_execution(setups_df, trades_df):
                     brokerage = st.number_input("Total Brokerage & Charges (₹)", min_value=0.0, step=10.0)
                     if st.button("Confirm TP2 Booking"):
                         backend_engine.confirm_exit_action(trade_id, "TP2", exit_price, exit_qty, brokerage)
-                        st.success("TP2 Booked. Trade Closed.")
+                        st.success("TP2 Booked.")
                         st.rerun()
-
                 elif action == "❌ Stop Loss Exit":
                     st.markdown("#### Stop Loss Execution")
                     exit_qty = st.number_input("Quantity Exited", min_value=1, max_value=current_qty, value=current_qty)
@@ -506,9 +550,8 @@ def render_trade_execution(setups_df, trades_df):
                     brokerage = st.number_input("Total Brokerage & Charges (₹)", min_value=0.0, step=10.0)
                     if st.button("Confirm SL Exit", type="primary"):
                         backend_engine.confirm_exit_action(trade_id, "SL", exit_price, exit_qty, brokerage)
-                        st.error("Stop Loss Hit. Trade Closed.")
+                        st.error("Stop Loss Hit.")
                         st.rerun()
-                        
                 elif action == "⏳ Time Exit":
                     st.markdown("#### Manual/Time Exit")
                     exit_qty = st.number_input("Quantity Exited", min_value=1, max_value=current_qty, value=current_qty)
@@ -516,7 +559,7 @@ def render_trade_execution(setups_df, trades_df):
                     brokerage = st.number_input("Total Brokerage & Charges (₹)", min_value=0.0, step=10.0)
                     if st.button("Confirm Manual Exit"):
                         backend_engine.confirm_exit_action(trade_id, "TIME_EXIT", exit_price, exit_qty, brokerage)
-                        st.info("Trade Closed Manually.")
+                        st.info("Closed Manually.")
                         st.rerun()
 
 # ========================================================
@@ -604,7 +647,7 @@ if __name__ == "__main__":
             st.header("🧭 Fund Desk")
             page = st.radio("Navigate", ["Dashboard", "Weekly Opportunities", "Trade Execution", "Performance & Analytics"])
             st.divider()
-            st.caption("Virtual AI Fund Manager v1.4 (Capital Intel)")
+            st.caption("Virtual AI Fund Manager v1.5 (Lifecycle)")
 
         if page == "Dashboard":
             render_dashboard(account_state, active_trades)
